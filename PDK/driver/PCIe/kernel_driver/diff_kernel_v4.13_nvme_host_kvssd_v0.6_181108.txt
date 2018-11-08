@@ -1,0 +1,3291 @@
+diff -urN /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/core.c kernel_v4.13/core.c
+--- /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/core.c	2018-05-09 19:09:35.205889659 +0900
++++ kernel_v4.13/core.c	2018-11-08 10:04:34.571067200 +0900
+@@ -24,12 +24,21 @@
+ #include <linux/types.h>
+ #include <linux/pr.h>
+ #include <linux/ptrace.h>
+-#include <linux/nvme_ioctl.h>
+ #include <linux/t10-pi.h>
+ #include <linux/pm_qos.h>
+ #include <asm/unaligned.h>
+ 
+ #include "nvme.h"
++#include <linux/file.h>
++#include <linux/fdtable.h>
++#include <linux/eventfd.h>
++#include <linux/kref.h>
++#include <linux/bio.h>
++#include <linux/freezer.h>
++#include <linux/wait.h>
++#include <linux/kthread.h>
++#include <linux/task_io_accounting_ops.h>
++#include "linux_nvme_ioctl.h"
+ #include "fabrics.h"
+ 
+ #define NVME_MINORS		(1U << MINORBITS)
+@@ -76,6 +85,559 @@
+ 
+ static struct class *nvme_class;
+ 
++#if 1
++/*
++ * PORT AIO Support logic from Kvepic.
++ */
++
++// AIO data structures
++static struct kmem_cache        *kaioctx_cachep = 0;
++static struct kmem_cache        *kaiocb_cachep = 0;
++static mempool_t *kaiocb_mempool = 0;
++static mempool_t *kaioctx_mempool = 0;
++
++static __u32 aio_context_id;
++
++#define AIOCTX_MAX 1024
++#define AIOCB_MAX (1024*64)
++
++static __u64 debug_completed  =0;
++static int debug_outstanding  =0;
++
++struct nvme_kaioctx
++{
++    struct nvme_aioctx uctx;
++    struct eventfd_ctx *eventctx;
++    struct list_head kaiocb_list;
++    spinlock_t kaioctx_spinlock;
++    struct kref ref;
++};
++
++static struct nvme_kaioctx **g_kaioctx_tb = NULL;
++static spinlock_t g_kaioctx_tb_spinlock;
++
++struct aio_user_ctx {
++	int nents;
++	int len;
++	struct page ** pages;
++	struct scatterlist *sg;
++	char data[1];
++};
++
++struct nvme_kaiocb
++{
++	struct list_head aiocb_list;
++	struct nvme_aioevent event;
++    int opcode;
++    struct nvme_command cmd;
++	struct gendisk *disk;
++    unsigned long start_time;
++    struct scatterlist meta_sg;
++    bool need_to_copy;
++    bool use_meta;
++	void *kv_data;
++	void *meta;
++	struct aio_user_ctx *user_ctx;
++	struct aio_user_ctx *kernel_ctx;
++    struct request *req;
++};
++
++/* context for aio worker.*/
++struct aio_worker_ctx{
++    int cpu;
++    spinlock_t kaiocb_spinlock;
++    struct list_head kaiocb_list;
++    wait_queue_head_t aio_waitqueue;
++};
++
++/* percpu aio worker context pointer */
++struct aio_worker_ctx * __percpu aio_w_ctx;
++/* percpu aio worker pointer */
++struct task_struct ** __percpu aio_worker;
++
++
++
++static void remove_kaioctx(struct nvme_kaioctx * ctx)
++{
++	struct nvme_kaiocb *tmpcb;
++    struct list_head *pos, *q;
++	unsigned long flags;
++    if (ctx) {
++        spin_lock_irqsave(&ctx->kaioctx_spinlock, flags);
++        list_for_each_safe(pos, q, &ctx->kaiocb_list){
++    	    tmpcb = list_entry(pos, struct nvme_kaiocb, aiocb_list);
++            list_del(pos);
++			mempool_free(tmpcb, kaiocb_mempool);
++   	    }
++        spin_unlock_irqrestore(&ctx->kaioctx_spinlock, flags);
++        eventfd_ctx_put(ctx->eventctx);	
++    	mempool_free(ctx, kaioctx_mempool);
++    }
++}
++
++static void cleanup_kaioctx(struct kref *kref) {
++    struct nvme_kaioctx *ctx = container_of(kref, struct nvme_kaioctx, ref);
++    remove_kaioctx(ctx);
++}
++
++static void ref_kaioctx(struct nvme_kaioctx *ctx) {
++    kref_get(&ctx->ref);
++}
++
++static void deref_kaioctx(struct nvme_kaioctx *ctx) {
++    kref_put(&ctx->ref, cleanup_kaioctx);
++}
++
++
++/* destroy memory pools
++ */
++static void destroy_aio_mempool(void)
++{
++    int i = 0;
++    if (g_kaioctx_tb) {
++        for (i = 0; i < AIOCTX_MAX; i++) {
++            if (g_kaioctx_tb[i]) {
++               remove_kaioctx(g_kaioctx_tb[i]);
++               g_kaioctx_tb[i] = NULL;
++            }
++        }
++        kfree(g_kaioctx_tb);
++        g_kaioctx_tb = NULL;
++    }
++    if (kaiocb_mempool)
++        mempool_destroy(kaiocb_mempool);
++    if (kaioctx_mempool)
++        mempool_destroy(kaioctx_mempool);
++    if (kaioctx_cachep)
++        kmem_cache_destroy(kaioctx_cachep);
++    if (kaiocb_cachep)
++        kmem_cache_destroy(kaiocb_cachep);
++}
++
++/* prepare basic data structures
++ * to support aio context and requests
++ */
++static int aio_service_init(void)
++{
++    g_kaioctx_tb = (struct nvme_kaioctx **)kmalloc(sizeof(struct nvme_kaioctx *) * AIOCTX_MAX, GFP_KERNEL);
++    if (!g_kaioctx_tb)
++        goto fail;
++    memset(g_kaioctx_tb, 0, sizeof(struct nvme_kaioctx *) * AIOCTX_MAX);
++
++	// slap allocator and memory pool
++    kaioctx_cachep = kmem_cache_create("nvme_kaioctx", sizeof(struct nvme_kaioctx), 0, 0, NULL);
++    if (!kaioctx_cachep)
++        goto fail;
++
++    kaiocb_cachep = kmem_cache_create("nvme_kaiocb", sizeof(struct nvme_kaiocb), 0, 0, NULL);
++    if (!kaiocb_cachep)
++        goto fail;
++
++    kaiocb_mempool = mempool_create_slab_pool(AIOCB_MAX, kaiocb_cachep);
++    if (!kaiocb_mempool)
++        goto fail;
++
++    kaioctx_mempool = mempool_create_slab_pool(AIOCTX_MAX, kaioctx_cachep);
++    if (!kaioctx_mempool)
++        goto fail;
++
++    // global variables
++    // context id 0 is reserved for normal I/O operations (synchronous)
++    aio_context_id = 1;
++    spin_lock_init(&g_kaioctx_tb_spinlock);
++    printk(KERN_DEBUG"nvme-aio: initialized\n");
++    return 0;
++
++fail:
++    destroy_aio_mempool();
++    return -ENOMEM;
++}
++
++/*
++ * release memory before exit
++ */
++static int aio_service_exit(void)
++{
++    destroy_aio_mempool();
++    printk(KERN_DEBUG"nvme-aio: unloaded\n");
++    return 0;
++}
++
++static struct nvme_kaioctx * find_kaioctx(__u32 ctxid) {
++    struct nvme_kaioctx * tmp = NULL;
++	unsigned long flags;
++    spin_lock_irqsave(&g_kaioctx_tb_spinlock, flags);
++    tmp = g_kaioctx_tb[ctxid];
++    if (tmp) ref_kaioctx(tmp);
++    spin_unlock_irqrestore(&g_kaioctx_tb_spinlock, flags);
++    return tmp;
++}
++
++
++/*
++ * find an aio context with a given id
++ */
++static int  set_aioctx_event(__u32 ctxid, struct nvme_kaiocb * kaiocb)
++{
++    struct nvme_kaioctx *tmp;
++	unsigned long flags;
++    tmp = find_kaioctx(ctxid);
++    if (tmp) {
++        spin_lock_irqsave(&tmp->kaioctx_spinlock, flags);
++	    list_add_tail(&kaiocb->aiocb_list, &tmp->kaiocb_list);
++        spin_unlock_irqrestore(&tmp->kaioctx_spinlock, flags);
++		eventfd_signal(tmp->eventctx, 1);
++#if 0
++		pr_err("nvme_set_aioctx: success to signal event %d %llu\n", kaiocb->event.ctxid, kaiocb->event.reqid);
++#endif
++        deref_kaioctx(tmp);
++        return 0;
++    } else {
++#if 0
++		pr_err("nvme_set_aioctx: failed to signal event %d.\n", ctxid);
++#endif
++    }
++
++    return -1;
++}
++
++/*
++ * delete an aio context
++ * it will release any resources allocated for this context
++ */
++static int nvme_del_aioctx(struct nvme_aioctx __user *uctx )
++{
++	struct nvme_kaioctx ctx;
++	unsigned long flags;
++    if (copy_from_user(&ctx, uctx, sizeof(struct nvme_aioctx)))
++        return -EFAULT;
++
++    spin_lock_irqsave(&g_kaioctx_tb_spinlock, flags);
++    if (g_kaioctx_tb[ctx.uctx.ctxid]) {
++        deref_kaioctx(g_kaioctx_tb[ctx.uctx.ctxid]);
++        g_kaioctx_tb[ctx.uctx.ctxid] = NULL;
++    }
++    spin_unlock_irqrestore(&g_kaioctx_tb_spinlock, flags);
++    return 0;
++}
++
++/*
++ * set up an aio context
++ * allocate a new context with given parameters and prepare a eventfd_context
++ */
++static int nvme_set_aioctx(struct nvme_aioctx __user *uctx )
++{
++    struct nvme_kaioctx *ctx;
++	struct fd efile;
++	struct eventfd_ctx *eventfd_ctx = NULL;
++	unsigned long flags;
++	int ret = 0;
++    int i = 0;
++    if (!capable(CAP_SYS_ADMIN))
++        return -EACCES;
++
++    ctx = mempool_alloc(kaioctx_mempool, GFP_NOIO); //ctx = kmem_cache_zalloc(kaioctx_cachep, GFP_KERNEL);
++    if (!ctx)
++        return -ENOMEM;
++
++    if (copy_from_user(ctx, uctx, sizeof(struct nvme_aioctx)))
++        return -EFAULT;
++
++	efile = fdget(ctx->uctx.eventfd);
++	if (!efile.file) {
++		pr_err("nvme_set_aioctx: failed to get efile for efd %d.\n", ctx->uctx.eventfd);
++		ret = -EBADF;
++		goto exit;
++	}
++
++	eventfd_ctx = eventfd_ctx_fileget(efile.file);
++	if (IS_ERR(eventfd_ctx)) {
++		pr_err("nvme_set_aioctx: failed to get eventfd_ctx for efd %d.\n", ctx->uctx.eventfd);
++		ret = PTR_ERR(eventfd_ctx);
++		goto put_efile;
++	}
++    // set context id
++    spin_lock_irqsave(&g_kaioctx_tb_spinlock, flags);
++    if(g_kaioctx_tb[aio_context_id]) {
++        for(i = 0; i < AIOCTX_MAX; i++) {
++           if(g_kaioctx_tb[i] == NULL) {
++               aio_context_id = i;
++               break;
++           }
++        }
++        if (i >= AIOCTX_MAX) {
++	    	pr_err("nvme_set_aioctx: too many aioctx open.\n");
++	    	ret = -EMFILE;
++	    	goto put_event_fd;
++        }
++    }
++    ctx->uctx.ctxid = aio_context_id++;
++    if (aio_context_id == AIOCTX_MAX)
++        aio_context_id = 0;
++	ctx->eventctx = eventfd_ctx;
++    spin_lock_init(&ctx->kaioctx_spinlock);
++    INIT_LIST_HEAD(&ctx->kaiocb_list);
++    kref_init(&ctx->ref);
++    g_kaioctx_tb[ctx->uctx.ctxid] = ctx;
++    spin_unlock_irqrestore(&g_kaioctx_tb_spinlock, flags);
++
++    if (copy_to_user(&uctx->ctxid, &ctx->uctx.ctxid, sizeof(ctx->uctx.ctxid)))
++    {
++		pr_err("nvme_set_aioctx: failed to copy context id %d to user.\n", ctx->uctx.ctxid);
++        ret =  -EINVAL;
++		goto cleanup;
++    }
++	eventfd_ctx = NULL;
++    debug_outstanding = 0;
++    debug_completed = 0;
++	fdput(efile);
++    return 0;
++cleanup:
++    spin_lock_irqsave(&g_kaioctx_tb_spinlock, flags);
++    g_kaioctx_tb[ctx->uctx.ctxid - 1] = NULL;
++    spin_unlock_irqrestore(&g_kaioctx_tb_spinlock, flags);
++	mempool_free(ctx, kaiocb_mempool);
++put_event_fd:
++	eventfd_ctx_put(eventfd_ctx);	
++put_efile:
++	fdput(efile);
++exit:
++	return ret;
++}
++
++/* get an aiocb, which represents a single I/O request.
++ */
++static struct nvme_kaiocb *get_aiocb(__u64 reqid) {
++	struct nvme_kaiocb *req;
++    req = mempool_alloc(kaiocb_mempool, GFP_NOIO); //ctx = kmem_cache_zalloc(kaioctx_cachep, GFP_KERNEL);
++    if (!req) return 0;
++
++    memset(req, 0, sizeof(*req));
++
++    INIT_LIST_HEAD(&req->aiocb_list);
++
++    req->event.reqid = reqid;
++
++    return req;
++}
++
++/* returns the completed events to users
++ */
++static int nvme_get_ioevents(struct nvme_aioevents __user *uevents)
++{
++	struct list_head *pos, *q;
++	struct nvme_kaiocb *tmp;
++	struct nvme_kaioctx *tmp_ctx;
++	unsigned long flags;
++    LIST_HEAD(tmp_head);
++	__u16 count =0;
++	__u16 nr = 0;
++    __u32 ctxid = 0;
++
++    if (!capable(CAP_SYS_ADMIN))
++        return -EACCES;
++
++    if (get_user(nr, &uevents->nr) < 0) { 	return -EINVAL;    }
++
++    if (nr == 0 || nr > 128) return -EINVAL;
++
++    if (get_user(ctxid, &uevents->ctxid) < 0) { return -EINVAL; }
++
++    tmp_ctx = find_kaioctx(ctxid);
++    if (tmp_ctx) {
++        spin_lock_irqsave(&tmp_ctx->kaioctx_spinlock, flags);
++        list_for_each_safe(pos, q, &tmp_ctx->kaiocb_list){
++    	    list_del_init(pos);
++            list_add(pos, &tmp_head);
++            count++;
++            if (nr == count) break;
++        }
++        spin_unlock_irqrestore(&tmp_ctx->kaioctx_spinlock, flags);
++        deref_kaioctx(tmp_ctx);
++        count = 0; 
++        list_for_each_safe(pos, q, &tmp_head){
++    	    list_del(pos);
++    	    tmp = list_entry(pos, struct nvme_kaiocb, aiocb_list);
++            copy_to_user(&uevents->events[count], &tmp->event, sizeof(struct nvme_aioevent));
++	        mempool_free(tmp, kaiocb_mempool);
++            count++;
++        }
++   	}
++    if (put_user(count, &uevents->nr)  < 0) { return -EINVAL; }
++
++    return 0;
++}
++
++static void kv_complete_aio_fn(struct nvme_kaiocb *cmdinfo) { 
++    struct request *req =  cmdinfo->req;
++	int i = 0;
++	blk_mq_free_request(req);
++	if (cmdinfo->need_to_copy && !cmdinfo->event.status) {
++        /*
++           unaligned user buffer, copy back to user if this request is for read.
++         */
++		if (is_kv_retrieve_cmd(cmdinfo->opcode) || is_kv_iter_read_cmd(cmdinfo->opcode)) {
++#if 0
++            char *data = cmdinfo->kv_data;
++            pr_err("kv_async_completion: data %c%c%c%c.\n", data[0], data[1], data[2], data[3]);
++#endif
++			(void)sg_copy_from_buffer(cmdinfo->user_ctx->sg, cmdinfo->user_ctx->nents,
++					cmdinfo->kv_data, cmdinfo->user_ctx->len);
++        }
++        for (i = 0; i < cmdinfo->kernel_ctx->nents; i++) {
++            put_page(sg_page(&cmdinfo->kernel_ctx->sg[i]));
++        }
++	}
++    if (cmdinfo->user_ctx) {
++        if (is_kv_store_cmd(cmdinfo->opcode) || is_kv_append_cmd(cmdinfo->opcode)) {
++            generic_end_io_acct(WRITE, &cmdinfo->disk->part0, cmdinfo->start_time);
++        } else {
++            generic_end_io_acct(READ, &cmdinfo->disk->part0, cmdinfo->start_time);
++        }
++		for (i = 0; i < cmdinfo->user_ctx->nents; i++) {
++			put_page(sg_page(&cmdinfo->user_ctx->sg[i]));
++        }
++	}
++    if (cmdinfo->use_meta) {
++        put_page(sg_page(&cmdinfo->meta_sg));
++    }
++
++    if (cmdinfo->need_to_copy) { 
++        kfree(cmdinfo->kernel_ctx);
++        kfree(cmdinfo->kv_data);
++    }
++    if (cmdinfo->user_ctx) kfree(cmdinfo->user_ctx);
++    if (cmdinfo->meta) kfree(cmdinfo->meta);
++
++
++	if (set_aioctx_event(cmdinfo->event.ctxid, cmdinfo)) {
++		mempool_free(cmdinfo, kaiocb_mempool);
++	}
++}
++
++
++static void wake_up_aio_worker(struct aio_worker_ctx *aio_ctx) {
++    wake_up(&aio_ctx->aio_waitqueue);
++}
++
++static void insert_aiocb_to_worker(struct nvme_kaiocb *aiocb) {
++        struct aio_worker_ctx *ctx = NULL;
++        unsigned long flags;
++        int cpu = smp_processor_id();
++        INIT_LIST_HEAD(&aiocb->aiocb_list);
++#if 0
++		pr_err("insert aiocb(%p) to aio_worker(%d)!\n", aiocb, cpu);
++#endif
++        ctx = per_cpu_ptr(aio_w_ctx, cpu);
++        spin_lock_irqsave(&ctx->kaiocb_spinlock, flags);
++        list_add_tail(&aiocb->aiocb_list, &ctx->kaiocb_list);
++        spin_unlock_irqrestore(&ctx->kaiocb_spinlock, flags);
++        wake_up_aio_worker(ctx);
++        return;
++}
++
++static void kv_async_completion(struct request *req, blk_status_t status){
++    struct nvme_kaiocb *aiocb = req->end_io_data;
++#if 0
++	pr_err("complition handler for aiocb(%p)!\n", aiocb);
++#endif
++    aiocb->req = req;
++    aiocb->event.result = le32_to_cpu(nvme_req(req)->result.u32);
++    aiocb->event.status = le16_to_cpu(nvme_req(req)->status);
++#if 0  
++    pr_err("result aiocb %p status %x result %x\n", aiocb, aiocb->event.status, aiocb->event.result);
++#endif
++    insert_aiocb_to_worker(aiocb);
++    return;
++}
++
++static int kvaio_percpu_worker_fn(void *arg) {
++    struct aio_worker_ctx *ctx = (struct aio_worker_ctx *)arg;
++    struct list_head *pos, *next;
++    unsigned long flags;
++    LIST_HEAD(tmp_list);
++	pr_err("start aio worker %u\n", ctx->cpu);
++    while(!kthread_should_stop() || !list_empty(&ctx->kaiocb_list)) {
++        if (list_empty(&ctx->kaiocb_list)) {
++            wait_event_interruptible_timeout(ctx->aio_waitqueue,
++                    !list_empty(&ctx->kaiocb_list), HZ/10);
++            continue;
++        }
++        INIT_LIST_HEAD(&tmp_list);
++        spin_lock_irqsave(&ctx->kaiocb_spinlock, flags);
++        list_splice(&ctx->kaiocb_list, &tmp_list);
++        INIT_LIST_HEAD(&ctx->kaiocb_list);
++        spin_unlock_irqrestore(&ctx->kaiocb_spinlock, flags);
++        if (!list_empty(&tmp_list)) {
++            list_for_each_safe(pos, next, &tmp_list) {
++                struct nvme_kaiocb *aiocb = list_entry(pos, struct nvme_kaiocb, aiocb_list);
++                list_del_init(pos);
++#if 0
++	            pr_err("process completion %p\n",aiocb);
++#endif
++                kv_complete_aio_fn(aiocb);
++            }
++        }
++    }
++    return 0;
++}
++
++static int aio_worker_init(void) {
++    struct task_struct **p = NULL;
++    struct aio_worker_ctx *ctx = NULL;
++    int i = 0;
++
++    aio_worker = alloc_percpu(struct task_struct *);
++    if (!aio_worker) {
++		pr_err("fail to alloc percpu worker task_struct!\n");
++        return -ENOMEM;
++    }
++    aio_w_ctx = alloc_percpu(struct aio_worker_ctx);
++    if (!aio_w_ctx) {
++		pr_err("fail to alloc percpu aio context!\n");
++        goto out_free;
++    }
++
++    for_each_online_cpu(i) {
++        ctx = per_cpu_ptr(aio_w_ctx, i);
++        ctx->cpu = i;
++        spin_lock_init(&ctx->kaiocb_spinlock);
++        INIT_LIST_HEAD(&ctx->kaiocb_list);
++        init_waitqueue_head(&ctx->aio_waitqueue);
++        p = per_cpu_ptr(aio_worker, i);
++        *p = kthread_create_on_node(kvaio_percpu_worker_fn, ctx, cpu_to_node(i), "aio_completion_worker/%u", i);
++        if (!(*p))
++            goto reset_pthread;
++        kthread_bind(*p, i);
++        wake_up_process(*p);
++    }
++    
++    return 0;
++reset_pthread:
++    for_each_online_cpu(i) {
++        p = per_cpu_ptr(aio_worker, i);
++        if (*p) kthread_stop(*p);
++    }
++out_free:
++    if (aio_worker)
++        free_percpu(aio_worker);
++    return -ENOMEM;
++}
++
++static void aio_worker_exit(void) {
++    struct task_struct **p = NULL;
++    int i = 0;
++    for_each_online_cpu(i) {
++        p = per_cpu_ptr(aio_worker, i);
++        if (*p) kthread_stop(*p);
++    }
++    free_percpu(aio_worker);
++    free_percpu(aio_w_ctx);
++    return;
++}
++#endif
++
++
+ int nvme_reset_ctrl(struct nvme_ctrl *ctrl)
+ {
+ 	if (!nvme_change_ctrl_state(ctrl, NVME_CTRL_RESETTING))
+@@ -134,7 +696,6 @@
+ 		blk_mq_requeue_request(req, true);
+ 		return;
+ 	}
+-
+ 	blk_mq_end_request(req, nvme_error_status(req));
+ }
+ EXPORT_SYMBOL_GPL(nvme_complete_rq);
+@@ -686,6 +1247,466 @@
+ 			result, timeout);
+ }
+ 
++
++#if 1
++/*
++ * There was two types of operation need to map single continueous physical continues physical address.
++ * 1. kv_exist and kv_iterate's buffer.
++ * 2. kv_store, kv_retrieve, and kv_delete's key buffer.
++ * Note.
++ * - check it's address 4byte word algined. If not malloc and copy data.
++ */
++static bool check_add_for_single_cont_phyaddress(void __user *address, unsigned length)
++{
++	unsigned offset = 0;
++	unsigned count = 0;
++
++	offset = offset_in_page(address);
++	count = DIV_ROUND_UP(offset + length, PAGE_SIZE);
++	if ((count > 1) || ((unsigned long)address & 3)) {
++		/* addr does not aligned as 4 bytes or addr needs more than one page */
++		return false;
++	}
++	return true;
++}
++
++static int user_addr_npages(int offset, int size)
++{
++	unsigned count = DIV_ROUND_UP(offset + size, PAGE_SIZE);
++	return count;
++}
++
++static struct aio_user_ctx *get_aio_user_ctx(void __user *addr, unsigned len, bool b_kernel)
++{
++	int offset = offset_in_page(addr);
++	int datalen = len;
++	int num_page = user_addr_npages(offset, len);
++	int size = 0;
++	struct aio_user_ctx  *user_ctx = NULL;
++	int mapped_pages = 0;
++	int i = 0;
++	size = sizeof (struct aio_user_ctx) + sizeof(__le64 *) * num_page
++			+ sizeof(struct scatterlist) * num_page -1;
++	/* need to keep user address to map to copy when complete request */
++	user_ctx = (struct aio_user_ctx *)kmalloc(size, GFP_KERNEL);
++	if (!user_ctx) {
++		return NULL;
++    }
++
++	user_ctx->nents = 0;
++	user_ctx->pages =(struct page **)user_ctx->data;
++	user_ctx->sg = (struct scatterlist *)(user_ctx->data + sizeof(__le64 *) * num_page);
++    if (b_kernel) {
++        struct page *page = NULL;
++        char *src_data = addr;
++        for(i = 0; i < num_page; i++) {
++            page = virt_to_page(src_data);
++            get_page(page);
++            user_ctx->pages[i] = page;
++            src_data += PAGE_SIZE;
++        }
++
++    } else {
++        mapped_pages = get_user_pages_fast((unsigned long)addr, num_page,
++                0, user_ctx->pages);
++        if (mapped_pages != num_page) {
++            user_ctx->nents = mapped_pages;
++            goto exit;
++        }
++    }
++    user_ctx->nents = num_page;
++    user_ctx->len = datalen;
++    sg_init_table(user_ctx->sg, num_page);
++    for(i = 0; i < num_page; i++) {
++        sg_set_page(&user_ctx->sg[i], user_ctx->pages[i],
++                min_t(unsigned, datalen, PAGE_SIZE - offset),
++                offset);
++        datalen -= (PAGE_SIZE - offset);
++        offset = 0;
++    }
++    sg_mark_end(&user_ctx->sg[i -1]);
++	return user_ctx;
++exit:
++	if (user_ctx) {
++		for (i = 0; i < user_ctx->nents; i++)
++			put_page(user_ctx->pages[i]);
++		kfree(user_ctx);
++	}
++	return NULL;
++}
++int __nvme_submit_kv_user_cmd(struct request_queue *q, struct nvme_command *cmd,
++		struct nvme_passthru_kv_cmd *pthr_cmd,
++		void __user *ubuffer, unsigned bufflen,
++		void __user *meta_buffer, unsigned meta_len, u32 meta_seed,
++		u32 *result, u32 *status, unsigned timeout, bool aio)
++{
++	struct nvme_ns *ns = q->queuedata;
++	struct gendisk *disk = ns ? ns->disk : NULL;
++	struct request *req;
++	int ret = 0;
++	struct nvme_kaiocb *aiocb = NULL;
++    struct aio_user_ctx  *user_ctx = NULL;
++	struct aio_user_ctx  *kernel_ctx = NULL;
++    struct scatterlist* meta_sg_ptr;
++    struct scatterlist meta_sg;
++    struct page* p_page = NULL;
++    struct nvme_io_param* param = NULL;
++    char *kv_data = NULL;
++    char *kv_meta = NULL;
++    bool need_to_copy = false; 
++	int i = 0, offset = 0;
++    unsigned len = 0;
++    unsigned long start_time = jiffies;
++
++	if (!disk)
++			return -EFAULT;
++
++    if (aio) {
++   		aiocb = get_aiocb(pthr_cmd->reqid);
++		if (!aiocb) {
++			ret = -ENOMEM;
++			goto out_end;
++        }
++        aiocb->cmd = *cmd;
++        aiocb->disk = disk;
++        cmd = &aiocb->cmd;
++    }
++	req = nvme_alloc_request(q, cmd, 0, NVME_QID_ANY);
++	if (IS_ERR(req)) {
++        if (aiocb) mempool_free(aiocb, kaiocb_mempool);
++		return PTR_ERR(req);
++    }
++
++	req->timeout = timeout ? timeout : ADMIN_TIMEOUT;
++    param = nvme_io_param(req);
++
++    param->kv_data_sg_ptr = NULL;
++    param->kv_meta_sg_ptr = NULL;
++    param->kv_data_nents = 0;
++    param->kv_data_len = 0;
++
++    if (ubuffer && bufflen) {
++        if ((unsigned long)ubuffer & 3) {
++            need_to_copy = true; 
++            len = DIV_ROUND_UP(bufflen, PAGE_SIZE)*PAGE_SIZE;
++            kv_data = kmalloc(len, GFP_KERNEL);
++            if (kv_data == NULL) {
++			    ret = -ENOMEM;
++                goto out_req_end;
++            }
++        }
++        user_ctx = get_aio_user_ctx(ubuffer, bufflen, false);
++        if (need_to_copy) {
++            kernel_ctx = get_aio_user_ctx(kv_data, bufflen, true);
++            if (kernel_ctx) {
++                if (is_kv_store_cmd(cmd->common.opcode) || is_kv_append_cmd(cmd->common.opcode)) {
++			        (void)sg_copy_to_buffer(user_ctx->sg, user_ctx->nents,
++					    kv_data, user_ctx->len);
++#if 0
++                    pr_err("copied data %c:%c:%c:%c: %c:%c:%c:%c.\n",
++                            kv_data[0], kv_data[1], kv_data[2], kv_data[3],
++                            kv_data[4], kv_data[5], kv_data[6], kv_data[7]);
++#endif
++                }
++            }
++
++        } else {
++            kernel_ctx = user_ctx;
++        }
++        if (user_ctx == NULL || kernel_ctx == NULL) {
++            ret = -ENOMEM;
++            goto out_unmap;
++        }
++        param->kv_data_sg_ptr = kernel_ctx->sg;
++        param->kv_data_nents = kernel_ctx->nents;
++        param->kv_data_len = kernel_ctx->len;
++        if (aio) {
++            aiocb->need_to_copy = need_to_copy;
++            aiocb->kv_data = kv_data;
++            aiocb->kernel_ctx = kernel_ctx;
++            aiocb->user_ctx = user_ctx;
++            aiocb->start_time = start_time;
++        }
++        if (is_kv_store_cmd(cmd->common.opcode) || is_kv_append_cmd(cmd->common.opcode)) {
++            generic_start_io_acct(WRITE, (bufflen >> 9 ? bufflen >>9 : 1), &disk->part0);
++        } else {
++            generic_start_io_acct(READ, (bufflen >> 9 ? bufflen >>9 : 1), &disk->part0);
++        }
++    }
++
++    if (meta_buffer && meta_len) {
++        if (check_add_for_single_cont_phyaddress(meta_buffer, meta_len)) {
++            ret = get_user_pages_fast((unsigned long)meta_buffer, 1, 0, &p_page);
++            if (ret != 1) {
++                ret = -ENOMEM;
++                goto out_unmap;
++            }
++            offset = offset_in_page(meta_buffer);
++        } else {
++            len = DIV_ROUND_UP(meta_len, 4) * 4;
++            kv_meta = kmalloc(len, GFP_KERNEL);
++            if (!kv_meta) {
++                ret = -ENOMEM;
++                goto out_unmap;
++            }
++            if (copy_from_user(kv_meta, meta_buffer, meta_len)) {
++                ret = -EFAULT;
++                goto out_free_meta;
++            }
++            offset = offset_in_page(kv_meta);
++            p_page = virt_to_page(kv_meta);
++            get_page(p_page);
++        }
++        if (aio) {
++            aiocb->use_meta = true;
++            aiocb->meta = kv_meta;
++            meta_sg_ptr = &aiocb->meta_sg;
++        } else {
++            meta_sg_ptr = &meta_sg;
++        }
++        sg_init_table(meta_sg_ptr, 1);
++        sg_set_page(meta_sg_ptr, p_page, meta_len, offset);
++        sg_mark_end(meta_sg_ptr);
++        param->kv_meta_sg_ptr = meta_sg_ptr;
++    } else {
++        param->kv_meta_sg_ptr = NULL;
++    }
++
++	if (aio) {
++		aiocb->event.ctxid = pthr_cmd->ctxid;
++		aiocb->event.reqid = pthr_cmd->reqid;
++		aiocb->opcode = cmd->common.opcode;
++		req->end_io_data = aiocb;
++		blk_execute_rq_nowait(req->q, disk, req, 0, kv_async_completion);
++		return 0;
++
++	} else {
++		blk_execute_rq(req->q, disk, req, 0);
++        if (nvme_req(req)->flags & NVME_REQ_CANCELLED)
++            ret = EINTR;
++        else
++		    ret = nvme_req(req)->status;
++
++		if (result)
++			*result = le32_to_cpu(nvme_req(req)->result.u32);
++		if (status)
++			*status = le16_to_cpu(nvme_req(req)->status);
++		if (ret) {
++			pr_err("__nvme_submit_user_cmd failed!!!!!: opcode(%02x)\n", cmd->common.opcode);
++		}
++    }
++    if (!ret && need_to_copy) {
++		if (is_kv_retrieve_cmd(cmd->common.opcode) || is_kv_iter_read_cmd(cmd->common.opcode)) {
++#if 0
++            char *data = kv_data;
++            pr_err("kv_async_completion: data %c%c%c%c.\n", data[0], data[1], data[2], data[3]);
++#endif
++			(void)sg_copy_from_buffer(user_ctx->sg, user_ctx->nents,
++					kv_data, user_ctx->len);
++        }
++    }
++ out_free_meta:
++    if (p_page) put_page(p_page);
++	if (kv_meta) kfree(kv_meta);
++ out_unmap:
++    if (user_ctx) {
++        for (i = 0; i < user_ctx->nents; i++) {
++            put_page(sg_page(&user_ctx->sg[i]));
++        }
++        kfree(user_ctx);
++    }
++    if (need_to_copy) {
++        if (kernel_ctx) {
++            for (i = 0; i < kernel_ctx->nents; i++) {
++                put_page(sg_page(&kernel_ctx->sg[i]));
++            }
++            kfree(kernel_ctx);
++        }
++        if (kv_data) kfree(kv_data);
++    }
++out_req_end:
++    if (aio && aiocb) mempool_free(aiocb, kaiocb_mempool);
++	blk_mq_free_request(req);
++
++    if (is_kv_store_cmd(cmd->common.opcode) || is_kv_append_cmd(cmd->common.opcode)) {
++        generic_end_io_acct(WRITE, &disk->part0, start_time);
++    } else {
++        generic_end_io_acct(READ, &disk->part0, start_time);
++    }
++out_end:
++	return ret;
++}
++
++static int nvme_user_kv_cmd(struct nvme_ctrl *ctrl,
++			struct nvme_ns *ns,
++			struct nvme_passthru_kv_cmd __user *ucmd, bool aio)
++{
++	struct nvme_passthru_kv_cmd cmd;
++	struct nvme_command c;
++	unsigned timeout = 0;
++	int status;
++	void __user *metadata = NULL;
++	unsigned meta_len = 0;
++    unsigned option = 0;
++    unsigned iter_handle = 0;
++	if (!capable(CAP_SYS_ADMIN))
++		return -EACCES;
++	if (copy_from_user(&cmd, ucmd, sizeof(cmd)))
++		return -EFAULT;
++	if (cmd.flags)
++		return -EINVAL;
++
++
++	/* filter out non kv command */
++	if (!is_kv_cmd(cmd.opcode)) {
++		return -EINVAL;
++	}
++	memset(&c, 0, sizeof(c));
++	c.common.opcode = cmd.opcode;
++	c.common.flags = cmd.flags;
++#ifdef KSID_SUPPORT
++	c.common.nsid = cmd.cdw3;
++#else
++	c.common.nsid = cpu_to_le32(cmd.nsid);
++#endif
++	if (cmd.timeout_ms) 
++		timeout = msecs_to_jiffies(cmd.timeout_ms);
++
++//    if (cmd.data_addr) {
++//		pr_err("nvme_user_kv_cmd: kv cmd opcode(%02x) info: key_length(%d) cdw11(%d) addr(%p) data_len(%d) cdw10(%d) data(%p).\n",
++//				cmd.opcode, cmd.key_length, cmd.cdw11, (void *)cmd.key_addr, cmd.data_length, cmd.cdw10, (void *)cmd.data_addr);
++//    }
++
++	switch(cmd.opcode) {
++		case nvme_cmd_kv_store:
++        case nvme_cmd_kv_append:
++            option = cpu_to_le32(cmd.cdw4);
++			c.kv_store.offset = cpu_to_le32(cmd.cdw5);
++			/* validate key length */
++            if (cmd.key_length >  KVCMD_MAX_KEY_SIZE ||
++                    cmd.key_length < KVCMD_MIN_KEY_SIZE) {
++				cmd.result = KVS_ERR_VALUE;
++				status = -EINVAL;
++				goto exit;
++            }
++			c.kv_store.key_len = cpu_to_le32(cmd.key_length -1); /* key len -1 */
++            c.kv_store.option = (option & 0xff);
++            /* set value size */
++            if (cmd.data_length % 4) {
++                c.kv_store.value_len = cpu_to_le32((cmd.data_length >> 2) + 1);
++                c.kv_store.invalid_byte = 4 - (cmd.data_length % 4);
++            } else {
++                c.kv_store.value_len = cpu_to_le32((cmd.data_length >> 2));
++            }
++
++			if (cmd.key_length > KVCMD_INLINE_KEY_MAX) {
++				metadata = (void __user*)cmd.key_addr;
++				meta_len = cmd.key_length;
++			} else {
++				memcpy(c.kv_store.key, cmd.key, cmd.key_length);
++			}
++		break;
++		case nvme_cmd_kv_retrieve:
++            option = cpu_to_le32(cmd.cdw4);
++			c.kv_retrieve.offset = cpu_to_le32(cmd.cdw5);
++			/* validate key length */
++            if (cmd.key_length >  KVCMD_MAX_KEY_SIZE ||
++                    cmd.key_length < KVCMD_MIN_KEY_SIZE) {
++				cmd.result = KVS_ERR_VALUE;
++				status = -EINVAL;
++				goto exit;
++            }
++			c.kv_retrieve.key_len = cpu_to_le32(cmd.key_length -1); /* key len - 1 */
++            c.kv_retrieve.option = (option & 0xff);
++			c.kv_retrieve.value_len = cpu_to_le32((cmd.data_length >> 2));
++
++			if (cmd.key_length > KVCMD_INLINE_KEY_MAX) {
++				metadata = (void __user*)cmd.key_addr;
++				meta_len = cmd.key_length;
++			} else {
++				memcpy(c.kv_retrieve.key, cmd.key, cmd.key_length);
++			}
++		break;
++		case nvme_cmd_kv_delete:
++            option = cpu_to_le32(cmd.cdw4);
++			/* validate key length */
++            if (cmd.key_length >  KVCMD_MAX_KEY_SIZE ||
++                    cmd.key_length < KVCMD_MIN_KEY_SIZE) {
++				cmd.result = KVS_ERR_VALUE;
++				status = -EINVAL;
++				goto exit;
++            }
++			c.kv_delete.key_len = cpu_to_le32(cmd.key_length -1);
++		    c.kv_delete.option = (option & 0xff);	
++			if (cmd.key_length > KVCMD_INLINE_KEY_MAX) {
++				metadata = (void __user *)cmd.key_addr;
++				meta_len = cmd.key_length;
++			} else {
++				memcpy(c.kv_delete.key, cmd.key, cmd.key_length);
++			}
++			break;
++		case nvme_cmd_kv_exist:
++            option = cpu_to_le32(cmd.cdw4);
++			/* validate key length */
++            if (cmd.key_length >  KVCMD_MAX_KEY_SIZE ||
++                    cmd.key_length < KVCMD_MIN_KEY_SIZE) {
++				cmd.result = KVS_ERR_VALUE;
++				status = -EINVAL;
++				goto exit;
++            }
++			c.kv_exist.key_len = cpu_to_le32(cmd.key_length -1);
++		    c.kv_exist.option = (option & 0xff);	
++			if (cmd.key_length > KVCMD_INLINE_KEY_MAX) {
++				metadata = (void __user *)cmd.key_addr;
++				meta_len = cmd.key_length;
++			} else {
++				memcpy(c.kv_exist.key, cmd.key, cmd.key_length);
++			}
++			break;
++		case nvme_cmd_kv_iter_req:
++            option = cpu_to_le32(cmd.cdw4);
++            iter_handle = cpu_to_le32(cmd.cdw5);
++            c.kv_iter_req.iter_handle = iter_handle & 0xff;
++            c.kv_iter_req.option = option & 0xff;
++            c.kv_iter_req.iter_val = cpu_to_le32(cmd.cdw12);
++            c.kv_iter_req.iter_bitmask = cpu_to_le32(cmd.cdw13);
++			break;
++		case nvme_cmd_kv_iter_read:
++            option = cpu_to_le32(cmd.cdw4);
++            iter_handle = cpu_to_le32(cmd.cdw5);
++            c.kv_iter_read.iter_handle = iter_handle & 0xff;
++            c.kv_iter_read.option = option & 0xff;
++			c.kv_iter_read.value_len = cpu_to_le32((cmd.data_length >> 2));
++		break;
++		default:
++				cmd.result = KVS_ERR_IO;
++				status = -EINVAL;
++				goto exit;
++	}
++
++//    if (cmd.data_addr) {
++//        u32 *c_data = c.common.cdw2;
++//		pr_err("nvme_user_kv_cmd: kv cmd opcode(%02x) info: key_length(%d) cdw11(%d) addr(%p) data_len(%d) cdw10(%d) data(%p) cdw5(%d) cdw6(%d) cdw7(%d) cdw8(%d) cdw9(%d) cdw10(%d) cdw11(%d) cdw12(%d) cdw13(%d) cdw14(%d) cdw15(%d).\n",
++//				cmd.opcode, cmd.key_length, cmd.cdw11, (void *)cmd.key_addr, cmd.data_length, cmd.cdw10, (void *)cmd.data_addr,
++//                c_data[3], c_data[4], c_data[5], c_data[6], c_data[7], c_data[8], c_data[9], c_data[10], c_data[11], c_data[12], c_data[13]);
++//    }
++	status = __nvme_submit_kv_user_cmd(ns ? ns->queue : ctrl->admin_q, &c, &cmd,
++					(void __user *)(uintptr_t)cmd.data_addr, cmd.data_length, metadata, meta_len, 0,
++					&cmd.result, &cmd.status, timeout, aio);
++exit:
++	if (!aio) {
++		if (put_user(cmd.result, &ucmd->result))
++			return -EFAULT;
++		if (put_user(cmd.status, &ucmd->status))
++			return -EFAULT;
++	}
++	return status;
++
++}
++#endif
++
++
++
+ static void nvme_keep_alive_end_io(struct request *rq, blk_status_t status)
+ {
+ 	struct nvme_ctrl *ctrl = rq->end_io_data;
+@@ -1032,6 +2053,18 @@
+ 		return nvme_user_cmd(ns->ctrl, ns, (void __user *)arg);
+ 	case NVME_IOCTL_SUBMIT_IO:
+ 		return nvme_submit_io(ns, (void __user *)arg);
++#if 1
++    case NVME_IOCTL_IO_KV_CMD:
++		return nvme_user_kv_cmd(ns->ctrl, ns, (void __user *)arg, false);
++	case NVME_IOCTL_AIO_CMD:
++		return nvme_user_kv_cmd(ns->ctrl, ns, (void __user *)arg, true);
++	case NVME_IOCTL_SET_AIOCTX:
++		return nvme_set_aioctx((void __user*)arg);
++	case NVME_IOCTL_DEL_AIOCTX:
++		return nvme_del_aioctx((void __user*)arg);
++	case NVME_IOCTL_GET_AIOEVENT:
++		return nvme_get_ioevents((void __user*)arg);
++#endif
+ 	default:
+ #ifdef CONFIG_NVM
+ 		if (ns->ndev)
+@@ -2837,7 +3870,15 @@
+ 		result = PTR_ERR(nvme_class);
+ 		goto unregister_chrdev;
+ 	}
+-
++#if 1
++    result = aio_service_init();
++    if (result)
++        goto unregister_chrdev;
++    
++    result = aio_worker_init();
++    if (result)
++		goto unregister_chrdev;
++#endif
+ 	return 0;
+ 
+ unregister_chrdev:
+@@ -2852,6 +3893,10 @@
+ 	class_destroy(nvme_class);
+ 	__unregister_chrdev(nvme_char_major, 0, NVME_MINORS, "nvme");
+ 	destroy_workqueue(nvme_wq);
++#if 1
++    aio_worker_exit();
++	aio_service_exit();
++#endif
+ }
+ 
+ MODULE_LICENSE("GPL");
+diff -urN /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/fabrics.c kernel_v4.13/fabrics.c
+--- /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/fabrics.c	2018-05-09 19:09:35.205889659 +0900
++++ kernel_v4.13/fabrics.c	2018-11-08 10:04:34.571067200 +0900
+@@ -75,7 +75,7 @@
+ 
+ 	kref_init(&host->ref);
+ 	snprintf(host->nqn, NVMF_NQN_SIZE,
+-		"nqn.2014-08.org.nvmexpress:NVMf:uuid:%pUb", &host->id);
++		"nqn.2014-08.org.nvmexpress:uuid:%pUb", &host->id);
+ 
+ 	mutex_lock(&nvmf_hosts_mutex);
+ 	list_add_tail(&host->list, &nvmf_hosts);
+diff -urN /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/fc.c kernel_v4.13/fc.c
+--- /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/fc.c	2018-05-09 19:09:35.205889659 +0900
++++ kernel_v4.13/fc.c	2018-11-08 10:04:34.571067200 +0900
+@@ -2477,10 +2477,10 @@
+ 	nvme_fc_abort_aen_ops(ctrl);
+ 
+ 	/* wait for all io that had to be aborted */
+-	spin_lock_irqsave(&ctrl->lock, flags);
++	spin_lock_irq(&ctrl->lock);
+ 	wait_event_lock_irq(ctrl->ioabort_wait, ctrl->iocnt == 0, ctrl->lock);
+ 	ctrl->flags &= ~FCCTRL_TERMIO;
+-	spin_unlock_irqrestore(&ctrl->lock, flags);
++	spin_unlock_irq(&ctrl->lock);
+ 
+ 	nvme_fc_term_aen_ops(ctrl);
+ 
+@@ -2693,6 +2693,7 @@
+ 	ctrl->rport = rport;
+ 	ctrl->dev = lport->dev;
+ 	ctrl->cnum = idx;
++	init_waitqueue_head(&ctrl->ioabort_wait);
+ 
+ 	get_device(ctrl->dev);
+ 	kref_init(&ctrl->ref);
+diff -urN /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/lightnvm.c kernel_v4.13/lightnvm.c
+--- /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/lightnvm.c	2018-05-09 19:09:35.205889659 +0900
++++ kernel_v4.13/lightnvm.c	2018-11-08 10:04:34.571067200 +0900
+@@ -22,7 +22,7 @@
+ 
+ #include "nvme.h"
+ 
+-#include <linux/nvme.h>
++#include "linux_nvme.h"
+ #include <linux/bitops.h>
+ #include <linux/lightnvm.h>
+ #include <linux/vmalloc.h>
+diff -urN /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/linux_nvme.h kernel_v4.13/linux_nvme.h
+--- /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/linux_nvme.h	1970-01-01 09:00:00.000000000 +0900
++++ kernel_v4.13/linux_nvme.h	2018-11-08 10:04:34.571067200 +0900
+@@ -0,0 +1,1350 @@
++/*
++ * Definitions for the NVM Express interface
++ * Copyright (c) 2011-2014, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#ifndef _LINUX_NVME_H
++#define _LINUX_NVME_H
++
++#include <linux/types.h>
++#include <linux/uuid.h>
++
++/* NQN names in commands fields specified one size */
++#define NVMF_NQN_FIELD_LEN	256
++
++/* However the max length of a qualified name is another size */
++#define NVMF_NQN_SIZE		223
++
++#define NVMF_TRSVCID_SIZE	32
++#define NVMF_TRADDR_SIZE	256
++#define NVMF_TSAS_SIZE		256
++
++#define NVME_DISC_SUBSYS_NAME	"nqn.2014-08.org.nvmexpress.discovery"
++
++#define NVME_RDMA_IP_PORT	4420
++
++enum nvme_subsys_type {
++	NVME_NQN_DISC	= 1,		/* Discovery type target subsystem */
++	NVME_NQN_NVME	= 2,		/* NVME type target subsystem */
++};
++
++/* Address Family codes for Discovery Log Page entry ADRFAM field */
++enum {
++	NVMF_ADDR_FAMILY_PCI	= 0,	/* PCIe */
++	NVMF_ADDR_FAMILY_IP4	= 1,	/* IP4 */
++	NVMF_ADDR_FAMILY_IP6	= 2,	/* IP6 */
++	NVMF_ADDR_FAMILY_IB	= 3,	/* InfiniBand */
++	NVMF_ADDR_FAMILY_FC	= 4,	/* Fibre Channel */
++};
++
++/* Transport Type codes for Discovery Log Page entry TRTYPE field */
++enum {
++	NVMF_TRTYPE_RDMA	= 1,	/* RDMA */
++	NVMF_TRTYPE_FC		= 2,	/* Fibre Channel */
++	NVMF_TRTYPE_LOOP	= 254,	/* Reserved for host usage */
++	NVMF_TRTYPE_MAX,
++};
++
++/* Transport Requirements codes for Discovery Log Page entry TREQ field */
++enum {
++	NVMF_TREQ_NOT_SPECIFIED	= 0,	/* Not specified */
++	NVMF_TREQ_REQUIRED	= 1,	/* Required */
++	NVMF_TREQ_NOT_REQUIRED	= 2,	/* Not Required */
++};
++
++/* RDMA QP Service Type codes for Discovery Log Page entry TSAS
++ * RDMA_QPTYPE field
++ */
++enum {
++	NVMF_RDMA_QPTYPE_CONNECTED	= 1, /* Reliable Connected */
++	NVMF_RDMA_QPTYPE_DATAGRAM	= 2, /* Reliable Datagram */
++};
++
++/* RDMA QP Service Type codes for Discovery Log Page entry TSAS
++ * RDMA_QPTYPE field
++ */
++enum {
++	NVMF_RDMA_PRTYPE_NOT_SPECIFIED	= 1, /* No Provider Specified */
++	NVMF_RDMA_PRTYPE_IB		= 2, /* InfiniBand */
++	NVMF_RDMA_PRTYPE_ROCE		= 3, /* InfiniBand RoCE */
++	NVMF_RDMA_PRTYPE_ROCEV2		= 4, /* InfiniBand RoCEV2 */
++	NVMF_RDMA_PRTYPE_IWARP		= 5, /* IWARP */
++};
++
++/* RDMA Connection Management Service Type codes for Discovery Log Page
++ * entry TSAS RDMA_CMS field
++ */
++enum {
++	NVMF_RDMA_CMS_RDMA_CM	= 1, /* Sockets based endpoint addressing */
++};
++
++#define NVME_AQ_DEPTH		32
++
++enum {
++	NVME_REG_CAP	= 0x0000,	/* Controller Capabilities */
++	NVME_REG_VS	= 0x0008,	/* Version */
++	NVME_REG_INTMS	= 0x000c,	/* Interrupt Mask Set */
++	NVME_REG_INTMC	= 0x0010,	/* Interrupt Mask Clear */
++	NVME_REG_CC	= 0x0014,	/* Controller Configuration */
++	NVME_REG_CSTS	= 0x001c,	/* Controller Status */
++	NVME_REG_NSSR	= 0x0020,	/* NVM Subsystem Reset */
++	NVME_REG_AQA	= 0x0024,	/* Admin Queue Attributes */
++	NVME_REG_ASQ	= 0x0028,	/* Admin SQ Base Address */
++	NVME_REG_ACQ	= 0x0030,	/* Admin CQ Base Address */
++	NVME_REG_CMBLOC = 0x0038,	/* Controller Memory Buffer Location */
++	NVME_REG_CMBSZ	= 0x003c,	/* Controller Memory Buffer Size */
++	NVME_REG_DBS	= 0x1000,	/* SQ 0 Tail Doorbell */
++};
++
++#define NVME_CAP_MQES(cap)	((cap) & 0xffff)
++#define NVME_CAP_TIMEOUT(cap)	(((cap) >> 24) & 0xff)
++#define NVME_CAP_STRIDE(cap)	(((cap) >> 32) & 0xf)
++#define NVME_CAP_NSSRC(cap)	(((cap) >> 36) & 0x1)
++#define NVME_CAP_MPSMIN(cap)	(((cap) >> 48) & 0xf)
++#define NVME_CAP_MPSMAX(cap)	(((cap) >> 52) & 0xf)
++
++#define NVME_CMB_BIR(cmbloc)	((cmbloc) & 0x7)
++#define NVME_CMB_OFST(cmbloc)	(((cmbloc) >> 12) & 0xfffff)
++#define NVME_CMB_SZ(cmbsz)	(((cmbsz) >> 12) & 0xfffff)
++#define NVME_CMB_SZU(cmbsz)	(((cmbsz) >> 8) & 0xf)
++
++#define NVME_CMB_WDS(cmbsz)	((cmbsz) & 0x10)
++#define NVME_CMB_RDS(cmbsz)	((cmbsz) & 0x8)
++#define NVME_CMB_LISTS(cmbsz)	((cmbsz) & 0x4)
++#define NVME_CMB_CQS(cmbsz)	((cmbsz) & 0x2)
++#define NVME_CMB_SQS(cmbsz)	((cmbsz) & 0x1)
++
++/*
++ * Submission and Completion Queue Entry Sizes for the NVM command set.
++ * (In bytes and specified as a power of two (2^n)).
++ */
++#define NVME_NVM_IOSQES		6
++#define NVME_NVM_IOCQES		4
++
++enum {
++	NVME_CC_ENABLE		= 1 << 0,
++	NVME_CC_CSS_NVM		= 0 << 4,
++	NVME_CC_MPS_SHIFT	= 7,
++	NVME_CC_ARB_RR		= 0 << 11,
++	NVME_CC_ARB_WRRU	= 1 << 11,
++	NVME_CC_ARB_VS		= 7 << 11,
++	NVME_CC_SHN_NONE	= 0 << 14,
++	NVME_CC_SHN_NORMAL	= 1 << 14,
++	NVME_CC_SHN_ABRUPT	= 2 << 14,
++	NVME_CC_SHN_MASK	= 3 << 14,
++	NVME_CC_IOSQES		= NVME_NVM_IOSQES << 16,
++	NVME_CC_IOCQES		= NVME_NVM_IOCQES << 20,
++	NVME_CSTS_RDY		= 1 << 0,
++	NVME_CSTS_CFS		= 1 << 1,
++	NVME_CSTS_NSSRO		= 1 << 4,
++	NVME_CSTS_SHST_NORMAL	= 0 << 2,
++	NVME_CSTS_SHST_OCCUR	= 1 << 2,
++	NVME_CSTS_SHST_CMPLT	= 2 << 2,
++	NVME_CSTS_SHST_MASK	= 3 << 2,
++};
++
++struct nvme_id_power_state {
++	__le16			max_power;	/* centiwatts */
++	__u8			rsvd2;
++	__u8			flags;
++	__le32			entry_lat;	/* microseconds */
++	__le32			exit_lat;	/* microseconds */
++	__u8			read_tput;
++	__u8			read_lat;
++	__u8			write_tput;
++	__u8			write_lat;
++	__le16			idle_power;
++	__u8			idle_scale;
++	__u8			rsvd19;
++	__le16			active_power;
++	__u8			active_work_scale;
++	__u8			rsvd23[9];
++};
++
++enum {
++	NVME_PS_FLAGS_MAX_POWER_SCALE	= 1 << 0,
++	NVME_PS_FLAGS_NON_OP_STATE	= 1 << 1,
++};
++
++struct nvme_id_ctrl {
++	__le16			vid;
++	__le16			ssvid;
++	char			sn[20];
++	char			mn[40];
++	char			fr[8];
++	__u8			rab;
++	__u8			ieee[3];
++	__u8			cmic;
++	__u8			mdts;
++	__le16			cntlid;
++	__le32			ver;
++	__le32			rtd3r;
++	__le32			rtd3e;
++	__le32			oaes;
++	__le32			ctratt;
++	__u8			rsvd100[156];
++	__le16			oacs;
++	__u8			acl;
++	__u8			aerl;
++	__u8			frmw;
++	__u8			lpa;
++	__u8			elpe;
++	__u8			npss;
++	__u8			avscc;
++	__u8			apsta;
++	__le16			wctemp;
++	__le16			cctemp;
++	__le16			mtfa;
++	__le32			hmpre;
++	__le32			hmmin;
++	__u8			tnvmcap[16];
++	__u8			unvmcap[16];
++	__le32			rpmbs;
++	__le16			edstt;
++	__u8			dsto;
++	__u8			fwug;
++	__le16			kas;
++	__le16			hctma;
++	__le16			mntmt;
++	__le16			mxtmt;
++	__le32			sanicap;
++	__u8			rsvd332[180];
++	__u8			sqes;
++	__u8			cqes;
++	__le16			maxcmd;
++	__le32			nn;
++	__le16			oncs;
++	__le16			fuses;
++	__u8			fna;
++	__u8			vwc;
++	__le16			awun;
++	__le16			awupf;
++	__u8			nvscc;
++	__u8			rsvd531;
++	__le16			acwu;
++	__u8			rsvd534[2];
++	__le32			sgls;
++	__u8			rsvd540[228];
++	char			subnqn[256];
++	__u8			rsvd1024[768];
++	__le32			ioccsz;
++	__le32			iorcsz;
++	__le16			icdoff;
++	__u8			ctrattr;
++	__u8			msdbd;
++	__u8			rsvd1804[244];
++	struct nvme_id_power_state	psd[32];
++	__u8			vs[1024];
++};
++
++enum {
++	NVME_CTRL_ONCS_COMPARE			= 1 << 0,
++	NVME_CTRL_ONCS_WRITE_UNCORRECTABLE	= 1 << 1,
++	NVME_CTRL_ONCS_DSM			= 1 << 2,
++	NVME_CTRL_ONCS_WRITE_ZEROES		= 1 << 3,
++	NVME_CTRL_VWC_PRESENT			= 1 << 0,
++	NVME_CTRL_OACS_SEC_SUPP                 = 1 << 0,
++	NVME_CTRL_OACS_DIRECTIVES		= 1 << 5,
++	NVME_CTRL_OACS_DBBUF_SUPP		= 1 << 8,
++};
++
++struct nvme_lbaf {
++	__le16			ms;
++	__u8			ds;
++	__u8			rp;
++};
++
++struct nvme_id_ns {
++	__le64			nsze;
++	__le64			ncap;
++	__le64			nuse;
++	__u8			nsfeat;
++	__u8			nlbaf;
++	__u8			flbas;
++	__u8			mc;
++	__u8			dpc;
++	__u8			dps;
++	__u8			nmic;
++	__u8			rescap;
++	__u8			fpi;
++	__u8			rsvd33;
++	__le16			nawun;
++	__le16			nawupf;
++	__le16			nacwu;
++	__le16			nabsn;
++	__le16			nabo;
++	__le16			nabspf;
++	__le16			noiob;
++	__u8			nvmcap[16];
++	__u8			rsvd64[40];
++	__u8			nguid[16];
++	__u8			eui64[8];
++	struct nvme_lbaf	lbaf[16];
++	__u8			rsvd192[192];
++	__u8			vs[3712];
++};
++
++enum {
++	NVME_ID_CNS_NS			= 0x00,
++	NVME_ID_CNS_CTRL		= 0x01,
++	NVME_ID_CNS_NS_ACTIVE_LIST	= 0x02,
++	NVME_ID_CNS_NS_DESC_LIST	= 0x03,
++	NVME_ID_CNS_NS_PRESENT_LIST	= 0x10,
++	NVME_ID_CNS_NS_PRESENT		= 0x11,
++	NVME_ID_CNS_CTRL_NS_LIST	= 0x12,
++	NVME_ID_CNS_CTRL_LIST		= 0x13,
++};
++
++enum {
++	NVME_DIR_IDENTIFY		= 0x00,
++	NVME_DIR_STREAMS		= 0x01,
++	NVME_DIR_SND_ID_OP_ENABLE	= 0x01,
++	NVME_DIR_SND_ST_OP_REL_ID	= 0x01,
++	NVME_DIR_SND_ST_OP_REL_RSC	= 0x02,
++	NVME_DIR_RCV_ID_OP_PARAM	= 0x01,
++	NVME_DIR_RCV_ST_OP_PARAM	= 0x01,
++	NVME_DIR_RCV_ST_OP_STATUS	= 0x02,
++	NVME_DIR_RCV_ST_OP_RESOURCE	= 0x03,
++	NVME_DIR_ENDIR			= 0x01,
++};
++
++enum {
++	NVME_NS_FEAT_THIN	= 1 << 0,
++	NVME_NS_FLBAS_LBA_MASK	= 0xf,
++	NVME_NS_FLBAS_META_EXT	= 0x10,
++	NVME_LBAF_RP_BEST	= 0,
++	NVME_LBAF_RP_BETTER	= 1,
++	NVME_LBAF_RP_GOOD	= 2,
++	NVME_LBAF_RP_DEGRADED	= 3,
++	NVME_NS_DPC_PI_LAST	= 1 << 4,
++	NVME_NS_DPC_PI_FIRST	= 1 << 3,
++	NVME_NS_DPC_PI_TYPE3	= 1 << 2,
++	NVME_NS_DPC_PI_TYPE2	= 1 << 1,
++	NVME_NS_DPC_PI_TYPE1	= 1 << 0,
++	NVME_NS_DPS_PI_FIRST	= 1 << 3,
++	NVME_NS_DPS_PI_MASK	= 0x7,
++	NVME_NS_DPS_PI_TYPE1	= 1,
++	NVME_NS_DPS_PI_TYPE2	= 2,
++	NVME_NS_DPS_PI_TYPE3	= 3,
++};
++
++struct nvme_ns_id_desc {
++	__u8 nidt;
++	__u8 nidl;
++	__le16 reserved;
++};
++
++#define NVME_NIDT_EUI64_LEN	8
++#define NVME_NIDT_NGUID_LEN	16
++#define NVME_NIDT_UUID_LEN	16
++
++enum {
++	NVME_NIDT_EUI64		= 0x01,
++	NVME_NIDT_NGUID		= 0x02,
++	NVME_NIDT_UUID		= 0x03,
++};
++
++struct nvme_smart_log {
++	__u8			critical_warning;
++	__u8			temperature[2];
++	__u8			avail_spare;
++	__u8			spare_thresh;
++	__u8			percent_used;
++	__u8			rsvd6[26];
++	__u8			data_units_read[16];
++	__u8			data_units_written[16];
++	__u8			host_reads[16];
++	__u8			host_writes[16];
++	__u8			ctrl_busy_time[16];
++	__u8			power_cycles[16];
++	__u8			power_on_hours[16];
++	__u8			unsafe_shutdowns[16];
++	__u8			media_errors[16];
++	__u8			num_err_log_entries[16];
++	__le32			warning_temp_time;
++	__le32			critical_comp_time;
++	__le16			temp_sensor[8];
++	__u8			rsvd216[296];
++};
++
++enum {
++	NVME_SMART_CRIT_SPARE		= 1 << 0,
++	NVME_SMART_CRIT_TEMPERATURE	= 1 << 1,
++	NVME_SMART_CRIT_RELIABILITY	= 1 << 2,
++	NVME_SMART_CRIT_MEDIA		= 1 << 3,
++	NVME_SMART_CRIT_VOLATILE_MEMORY	= 1 << 4,
++};
++
++enum {
++	NVME_AER_NOTICE_NS_CHANGED	= 0x0002,
++};
++
++struct nvme_lba_range_type {
++	__u8			type;
++	__u8			attributes;
++	__u8			rsvd2[14];
++	__u64			slba;
++	__u64			nlb;
++	__u8			guid[16];
++	__u8			rsvd48[16];
++};
++
++enum {
++	NVME_LBART_TYPE_FS	= 0x01,
++	NVME_LBART_TYPE_RAID	= 0x02,
++	NVME_LBART_TYPE_CACHE	= 0x03,
++	NVME_LBART_TYPE_SWAP	= 0x04,
++
++	NVME_LBART_ATTRIB_TEMP	= 1 << 0,
++	NVME_LBART_ATTRIB_HIDE	= 1 << 1,
++};
++
++struct nvme_reservation_status {
++	__le32	gen;
++	__u8	rtype;
++	__u8	regctl[2];
++	__u8	resv5[2];
++	__u8	ptpls;
++	__u8	resv10[13];
++	struct {
++		__le16	cntlid;
++		__u8	rcsts;
++		__u8	resv3[5];
++		__le64	hostid;
++		__le64	rkey;
++	} regctl_ds[];
++};
++
++enum nvme_async_event_type {
++	NVME_AER_TYPE_ERROR	= 0,
++	NVME_AER_TYPE_SMART	= 1,
++	NVME_AER_TYPE_NOTICE	= 2,
++};
++
++/* I/O commands */
++
++enum nvme_opcode {
++	nvme_cmd_flush		= 0x00,
++	nvme_cmd_write		= 0x01,
++	nvme_cmd_read		= 0x02,
++	nvme_cmd_write_uncor	= 0x04,
++	nvme_cmd_compare	= 0x05,
++	nvme_cmd_write_zeroes	= 0x08,
++	nvme_cmd_dsm		= 0x09,
++	nvme_cmd_resv_register	= 0x0d,
++	nvme_cmd_resv_report	= 0x0e,
++	nvme_cmd_resv_acquire	= 0x11,
++	nvme_cmd_resv_release	= 0x15,
++#if 1
++	nvme_cmd_kv_store	= 0x81,
++	nvme_cmd_kv_append	= 0x83,
++	nvme_cmd_kv_retrieve	= 0x90,
++	nvme_cmd_kv_delete	= 0xA1,
++	nvme_cmd_kv_iter_req	= 0xB1,
++	nvme_cmd_kv_iter_read	= 0xB2,
++	nvme_cmd_kv_exist	= 0xB3,
++#endif
++};
++#if 1
++#define KVCMD_INLINE_KEY_MAX	(16)
++#define KVCMD_MAX_KEY_SIZE		(255)
++#define KVCMD_MIN_KEY_SIZE		(4)
++#endif
++
++/*
++ * Descriptor subtype - lower 4 bits of nvme_(keyed_)sgl_desc identifier
++ *
++ * @NVME_SGL_FMT_ADDRESS:     absolute address of the data block
++ * @NVME_SGL_FMT_OFFSET:      relative offset of the in-capsule data block
++ * @NVME_SGL_FMT_INVALIDATE:  RDMA transport specific remote invalidation
++ *                            request subtype
++ */
++enum {
++	NVME_SGL_FMT_ADDRESS		= 0x00,
++	NVME_SGL_FMT_OFFSET		= 0x01,
++	NVME_SGL_FMT_INVALIDATE		= 0x0f,
++};
++
++/*
++ * Descriptor type - upper 4 bits of nvme_(keyed_)sgl_desc identifier
++ *
++ * For struct nvme_sgl_desc:
++ *   @NVME_SGL_FMT_DATA_DESC:		data block descriptor
++ *   @NVME_SGL_FMT_SEG_DESC:		sgl segment descriptor
++ *   @NVME_SGL_FMT_LAST_SEG_DESC:	last sgl segment descriptor
++ *
++ * For struct nvme_keyed_sgl_desc:
++ *   @NVME_KEY_SGL_FMT_DATA_DESC:	keyed data block descriptor
++ */
++enum {
++	NVME_SGL_FMT_DATA_DESC		= 0x00,
++	NVME_SGL_FMT_SEG_DESC		= 0x02,
++	NVME_SGL_FMT_LAST_SEG_DESC	= 0x03,
++	NVME_KEY_SGL_FMT_DATA_DESC	= 0x04,
++};
++
++struct nvme_sgl_desc {
++	__le64	addr;
++	__le32	length;
++	__u8	rsvd[3];
++	__u8	type;
++};
++
++struct nvme_keyed_sgl_desc {
++	__le64	addr;
++	__u8	length[3];
++	__u8	key[4];
++	__u8	type;
++};
++
++union nvme_data_ptr {
++	struct {
++		__le64	prp1;
++		__le64	prp2;
++	};
++	struct nvme_sgl_desc	sgl;
++	struct nvme_keyed_sgl_desc ksgl;
++};
++
++/*
++ * Lowest two bits of our flags field (FUSE field in the spec):
++ *
++ * @NVME_CMD_FUSE_FIRST:   Fused Operation, first command
++ * @NVME_CMD_FUSE_SECOND:  Fused Operation, second command
++ *
++ * Highest two bits in our flags field (PSDT field in the spec):
++ *
++ * @NVME_CMD_PSDT_SGL_METABUF:	Use SGLS for this transfer,
++ *	If used, MPTR contains addr of single physical buffer (byte aligned).
++ * @NVME_CMD_PSDT_SGL_METASEG:	Use SGLS for this transfer,
++ *	If used, MPTR contains an address of an SGL segment containing
++ *	exactly 1 SGL descriptor (qword aligned).
++ */
++enum {
++	NVME_CMD_FUSE_FIRST	= (1 << 0),
++	NVME_CMD_FUSE_SECOND	= (1 << 1),
++
++	NVME_CMD_SGL_METABUF	= (1 << 6),
++	NVME_CMD_SGL_METASEG	= (1 << 7),
++	NVME_CMD_SGL_ALL	= NVME_CMD_SGL_METABUF | NVME_CMD_SGL_METASEG,
++};
++
++struct nvme_common_command {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__le32			cdw2[2];
++	__le64			metadata;
++	union nvme_data_ptr	dptr;
++	__le32			cdw10[6];
++};
++
++struct nvme_rw_command {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd2;
++	__le64			metadata;
++	union nvme_data_ptr	dptr;
++	__le64			slba;
++	__le16			length;
++	__le16			control;
++	__le32			dsmgmt;
++	__le32			reftag;
++	__le16			apptag;
++	__le16			appmask;
++};
++
++enum {
++	NVME_RW_LR			= 1 << 15,
++	NVME_RW_FUA			= 1 << 14,
++	NVME_RW_DSM_FREQ_UNSPEC		= 0,
++	NVME_RW_DSM_FREQ_TYPICAL	= 1,
++	NVME_RW_DSM_FREQ_RARE		= 2,
++	NVME_RW_DSM_FREQ_READS		= 3,
++	NVME_RW_DSM_FREQ_WRITES		= 4,
++	NVME_RW_DSM_FREQ_RW		= 5,
++	NVME_RW_DSM_FREQ_ONCE		= 6,
++	NVME_RW_DSM_FREQ_PREFETCH	= 7,
++	NVME_RW_DSM_FREQ_TEMP		= 8,
++	NVME_RW_DSM_LATENCY_NONE	= 0 << 4,
++	NVME_RW_DSM_LATENCY_IDLE	= 1 << 4,
++	NVME_RW_DSM_LATENCY_NORM	= 2 << 4,
++	NVME_RW_DSM_LATENCY_LOW		= 3 << 4,
++	NVME_RW_DSM_SEQ_REQ		= 1 << 6,
++	NVME_RW_DSM_COMPRESSED		= 1 << 7,
++	NVME_RW_PRINFO_PRCHK_REF	= 1 << 10,
++	NVME_RW_PRINFO_PRCHK_APP	= 1 << 11,
++	NVME_RW_PRINFO_PRCHK_GUARD	= 1 << 12,
++	NVME_RW_PRINFO_PRACT		= 1 << 13,
++	NVME_RW_DTYPE_STREAMS		= 1 << 4,
++};
++
++struct nvme_dsm_cmd {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd2[2];
++	union nvme_data_ptr	dptr;
++	__le32			nr;
++	__le32			attributes;
++	__u32			rsvd12[4];
++};
++
++enum {
++	NVME_DSMGMT_IDR		= 1 << 0,
++	NVME_DSMGMT_IDW		= 1 << 1,
++	NVME_DSMGMT_AD		= 1 << 2,
++};
++
++#define NVME_DSM_MAX_RANGES	256
++
++struct nvme_dsm_range {
++	__le32			cattr;
++	__le32			nlb;
++	__le64			slba;
++};
++
++struct nvme_write_zeroes_cmd {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd2;
++	__le64			metadata;
++	union nvme_data_ptr	dptr;
++	__le64			slba;
++	__le16			length;
++	__le16			control;
++	__le32			dsmgmt;
++	__le32			reftag;
++	__le16			apptag;
++	__le16			appmask;
++};
++
++/* Features */
++
++struct nvme_feat_auto_pst {
++	__le64 entries[32];
++};
++
++enum {
++	NVME_HOST_MEM_ENABLE	= (1 << 0),
++	NVME_HOST_MEM_RETURN	= (1 << 1),
++};
++
++#if 1
++/* KV SSD command */
++struct nvme_kv_store_command {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd;
++	__le32			offset;
++	__u32			rsvd2;
++	union nvme_data_ptr	dptr; /* value dptr prp1,2 */
++	__le32			value_len; /* size in word */
++    __u8            key_len; /* 0 ~ 255 (key len -1) */
++    __u8            option;
++    __u8            invalid_byte:2;
++    __u8            rsvd3:6;
++    __u8            rsvd4;
++	union {
++		struct {
++			char	key[16];
++		};
++		struct {
++			__le64	key_prp;
++			__le64	key_prp2;
++		};
++	};
++};
++
++struct nvme_kv_append_command {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd;
++	__le32			offset;
++	__u32			rsvd2;
++	union nvme_data_ptr	dptr; /* value dptr prp1,2 */
++	__le32			value_len; /* size in word */
++    __u8            key_len; /* 0 ~ 255 (key len -1) */
++    __u8            option;
++    __u8            invalid_byte:2;
++    __u8            rsvd3:6;
++    __u8            rsvd4;
++	union {
++		struct {
++			char	key[16];
++		};
++		struct {
++			__le64	key_prp;
++			__le64	key_prp2;
++		};
++	};
++};
++
++struct nvme_kv_retrieve_command {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd;
++	__le32			offset;
++	__u32			rsvd2;
++	union nvme_data_ptr	dptr; /* value dptr prp1,2 */
++	__le32			value_len; /* size in word */
++    __u8            key_len; /* 0 ~ 255 (key len -1) */
++    __u8            option;
++    __u16           rsvd3;
++	union {
++		struct {
++			char	key[16];
++		};
++		struct {
++			__le64	key_prp;
++			__le64	key_prp2;
++		};
++	};
++};
++
++struct nvme_kv_delete_command {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd;
++	__le32			offset;
++	__u32			rsvd2;
++	__u64			rsvd3[2];
++	__le32			value_len; /* should be zero*/
++    __u8            key_len; /* 0 ~ 255 (key len -1) */
++    __u8            option;
++    __u16           rsvd4;
++	union {
++		struct {
++			char	key[16];
++		};
++		struct {
++			__le64	key_prp;
++			__le64	key_prp2;
++		};
++	};
++};
++
++struct nvme_kv_iter_req_command {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd[4];
++	__le32			zero; /* should be zero*/
++    __u8            iter_handle;
++    __u8            option;
++    __u16           rsvd2;
++    __le32          iter_val;
++    __le32          iter_bitmask;
++    __u64           rsvd3;
++};
++
++
++struct nvme_kv_iter_read_command {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd[2];
++	union nvme_data_ptr	dptr; /* value dptr prp1,2 */
++	__le32			value_len; /* size in word */
++    __u8            iter_handle; /* 0 ~ 255 (key len -1) */
++    __u8            option;
++    __u16           rsvd2;
++    __u64           rsvd3[2];
++};
++struct nvme_kv_exist_command {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd;
++	__le32			offset;
++	__u32			rsvd2;
++	__u64			rsvd3[2];
++	__le32			value_len; /* should be zero*/
++    __u8            key_len; /* 0 ~ 255 (key len -1) */
++    __u8            option;
++    __u16           rsvd4;
++	union {
++		struct {
++			char	key[16];
++		};
++		struct {
++			__le64	key_prp;
++			__le64	key_prp2;
++		};
++	};
++};
++
++#endif
++
++
++/* Admin commands */
++
++enum nvme_admin_opcode {
++	nvme_admin_delete_sq		= 0x00,
++	nvme_admin_create_sq		= 0x01,
++	nvme_admin_get_log_page		= 0x02,
++	nvme_admin_delete_cq		= 0x04,
++	nvme_admin_create_cq		= 0x05,
++	nvme_admin_identify		= 0x06,
++	nvme_admin_abort_cmd		= 0x08,
++	nvme_admin_set_features		= 0x09,
++	nvme_admin_get_features		= 0x0a,
++	nvme_admin_async_event		= 0x0c,
++	nvme_admin_ns_mgmt		= 0x0d,
++	nvme_admin_activate_fw		= 0x10,
++	nvme_admin_download_fw		= 0x11,
++	nvme_admin_ns_attach		= 0x15,
++	nvme_admin_keep_alive		= 0x18,
++	nvme_admin_directive_send	= 0x19,
++	nvme_admin_directive_recv	= 0x1a,
++	nvme_admin_dbbuf		= 0x7C,
++	nvme_admin_format_nvm		= 0x80,
++	nvme_admin_security_send	= 0x81,
++	nvme_admin_security_recv	= 0x82,
++};
++
++enum {
++	NVME_QUEUE_PHYS_CONTIG	= (1 << 0),
++	NVME_CQ_IRQ_ENABLED	= (1 << 1),
++	NVME_SQ_PRIO_URGENT	= (0 << 1),
++	NVME_SQ_PRIO_HIGH	= (1 << 1),
++	NVME_SQ_PRIO_MEDIUM	= (2 << 1),
++	NVME_SQ_PRIO_LOW	= (3 << 1),
++	NVME_FEAT_ARBITRATION	= 0x01,
++	NVME_FEAT_POWER_MGMT	= 0x02,
++	NVME_FEAT_LBA_RANGE	= 0x03,
++	NVME_FEAT_TEMP_THRESH	= 0x04,
++	NVME_FEAT_ERR_RECOVERY	= 0x05,
++	NVME_FEAT_VOLATILE_WC	= 0x06,
++	NVME_FEAT_NUM_QUEUES	= 0x07,
++	NVME_FEAT_IRQ_COALESCE	= 0x08,
++	NVME_FEAT_IRQ_CONFIG	= 0x09,
++	NVME_FEAT_WRITE_ATOMIC	= 0x0a,
++	NVME_FEAT_ASYNC_EVENT	= 0x0b,
++	NVME_FEAT_AUTO_PST	= 0x0c,
++	NVME_FEAT_HOST_MEM_BUF	= 0x0d,
++	NVME_FEAT_KATO		= 0x0f,
++	NVME_FEAT_SW_PROGRESS	= 0x80,
++	NVME_FEAT_HOST_ID	= 0x81,
++	NVME_FEAT_RESV_MASK	= 0x82,
++	NVME_FEAT_RESV_PERSIST	= 0x83,
++	NVME_LOG_ERROR		= 0x01,
++	NVME_LOG_SMART		= 0x02,
++	NVME_LOG_FW_SLOT	= 0x03,
++	NVME_LOG_DISC		= 0x70,
++	NVME_LOG_RESERVATION	= 0x80,
++	NVME_FWACT_REPL		= (0 << 3),
++	NVME_FWACT_REPL_ACTV	= (1 << 3),
++	NVME_FWACT_ACTV		= (2 << 3),
++};
++
++struct nvme_identify {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd2[2];
++	union nvme_data_ptr	dptr;
++	__u8			cns;
++	__u8			rsvd3;
++	__le16			ctrlid;
++	__u32			rsvd11[5];
++};
++
++#define NVME_IDENTIFY_DATA_SIZE 4096
++
++struct nvme_features {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd2[2];
++	union nvme_data_ptr	dptr;
++	__le32			fid;
++	__le32			dword11;
++	__le32                  dword12;
++	__le32                  dword13;
++	__le32                  dword14;
++	__le32                  dword15;
++};
++
++struct nvme_host_mem_buf_desc {
++	__le64			addr;
++	__le32			size;
++	__u32			rsvd;
++};
++
++struct nvme_create_cq {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__u32			rsvd1[5];
++	__le64			prp1;
++	__u64			rsvd8;
++	__le16			cqid;
++	__le16			qsize;
++	__le16			cq_flags;
++	__le16			irq_vector;
++	__u32			rsvd12[4];
++};
++
++struct nvme_create_sq {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__u32			rsvd1[5];
++	__le64			prp1;
++	__u64			rsvd8;
++	__le16			sqid;
++	__le16			qsize;
++	__le16			sq_flags;
++	__le16			cqid;
++	__u32			rsvd12[4];
++};
++
++struct nvme_delete_queue {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__u32			rsvd1[9];
++	__le16			qid;
++	__u16			rsvd10;
++	__u32			rsvd11[5];
++};
++
++struct nvme_abort_cmd {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__u32			rsvd1[9];
++	__le16			sqid;
++	__u16			cid;
++	__u32			rsvd11[5];
++};
++
++struct nvme_download_firmware {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__u32			rsvd1[5];
++	union nvme_data_ptr	dptr;
++	__le32			numd;
++	__le32			offset;
++	__u32			rsvd12[4];
++};
++
++struct nvme_format_cmd {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd2[4];
++	__le32			cdw10;
++	__u32			rsvd11[5];
++};
++
++struct nvme_get_log_page_command {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd2[2];
++	union nvme_data_ptr	dptr;
++	__u8			lid;
++	__u8			rsvd10;
++	__le16			numdl;
++	__le16			numdu;
++	__u16			rsvd11;
++	__le32			lpol;
++	__le32			lpou;
++	__u32			rsvd14[2];
++};
++
++struct nvme_directive_cmd {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd2[2];
++	union nvme_data_ptr	dptr;
++	__le32			numd;
++	__u8			doper;
++	__u8			dtype;
++	__le16			dspec;
++	__u8			endir;
++	__u8			tdtype;
++	__u16			rsvd15;
++
++	__u32			rsvd16[3];
++};
++
++/*
++ * Fabrics subcommands.
++ */
++enum nvmf_fabrics_opcode {
++	nvme_fabrics_command		= 0x7f,
++};
++
++enum nvmf_capsule_command {
++	nvme_fabrics_type_property_set	= 0x00,
++	nvme_fabrics_type_connect	= 0x01,
++	nvme_fabrics_type_property_get	= 0x04,
++};
++
++struct nvmf_common_command {
++	__u8	opcode;
++	__u8	resv1;
++	__u16	command_id;
++	__u8	fctype;
++	__u8	resv2[35];
++	__u8	ts[24];
++};
++
++/*
++ * The legal cntlid range a NVMe Target will provide.
++ * Note that cntlid of value 0 is considered illegal in the fabrics world.
++ * Devices based on earlier specs did not have the subsystem concept;
++ * therefore, those devices had their cntlid value set to 0 as a result.
++ */
++#define NVME_CNTLID_MIN		1
++#define NVME_CNTLID_MAX		0xffef
++#define NVME_CNTLID_DYNAMIC	0xffff
++
++#define MAX_DISC_LOGS	255
++
++/* Discovery log page entry */
++struct nvmf_disc_rsp_page_entry {
++	__u8		trtype;
++	__u8		adrfam;
++	__u8		subtype;
++	__u8		treq;
++	__le16		portid;
++	__le16		cntlid;
++	__le16		asqsz;
++	__u8		resv8[22];
++	char		trsvcid[NVMF_TRSVCID_SIZE];
++	__u8		resv64[192];
++	char		subnqn[NVMF_NQN_FIELD_LEN];
++	char		traddr[NVMF_TRADDR_SIZE];
++	union tsas {
++		char		common[NVMF_TSAS_SIZE];
++		struct rdma {
++			__u8	qptype;
++			__u8	prtype;
++			__u8	cms;
++			__u8	resv3[5];
++			__u16	pkey;
++			__u8	resv10[246];
++		} rdma;
++	} tsas;
++};
++
++/* Discovery log page header */
++struct nvmf_disc_rsp_page_hdr {
++	__le64		genctr;
++	__le64		numrec;
++	__le16		recfmt;
++	__u8		resv14[1006];
++	struct nvmf_disc_rsp_page_entry entries[0];
++};
++
++struct nvmf_connect_command {
++	__u8		opcode;
++	__u8		resv1;
++	__u16		command_id;
++	__u8		fctype;
++	__u8		resv2[19];
++	union nvme_data_ptr dptr;
++	__le16		recfmt;
++	__le16		qid;
++	__le16		sqsize;
++	__u8		cattr;
++	__u8		resv3;
++	__le32		kato;
++	__u8		resv4[12];
++};
++
++struct nvmf_connect_data {
++	uuid_t		hostid;
++	__le16		cntlid;
++	char		resv4[238];
++	char		subsysnqn[NVMF_NQN_FIELD_LEN];
++	char		hostnqn[NVMF_NQN_FIELD_LEN];
++	char		resv5[256];
++};
++
++struct nvmf_property_set_command {
++	__u8		opcode;
++	__u8		resv1;
++	__u16		command_id;
++	__u8		fctype;
++	__u8		resv2[35];
++	__u8		attrib;
++	__u8		resv3[3];
++	__le32		offset;
++	__le64		value;
++	__u8		resv4[8];
++};
++
++struct nvmf_property_get_command {
++	__u8		opcode;
++	__u8		resv1;
++	__u16		command_id;
++	__u8		fctype;
++	__u8		resv2[35];
++	__u8		attrib;
++	__u8		resv3[3];
++	__le32		offset;
++	__u8		resv4[16];
++};
++
++struct nvme_dbbuf {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__u32			rsvd1[5];
++	__le64			prp1;
++	__le64			prp2;
++	__u32			rsvd12[6];
++};
++
++struct streams_directive_params {
++	__le16	msl;
++	__le16	nssa;
++	__le16	nsso;
++	__u8	rsvd[10];
++	__le32	sws;
++	__le16	sgs;
++	__le16	nsa;
++	__le16	nso;
++	__u8	rsvd2[6];
++};
++
++struct nvme_command {
++	union {
++		struct nvme_common_command common;
++		struct nvme_rw_command rw;
++		struct nvme_identify identify;
++		struct nvme_features features;
++		struct nvme_create_cq create_cq;
++		struct nvme_create_sq create_sq;
++		struct nvme_delete_queue delete_queue;
++		struct nvme_download_firmware dlfw;
++		struct nvme_format_cmd format;
++		struct nvme_dsm_cmd dsm;
++		struct nvme_write_zeroes_cmd write_zeroes;
++		struct nvme_abort_cmd abort;
++		struct nvme_get_log_page_command get_log_page;
++		struct nvmf_common_command fabrics;
++		struct nvmf_connect_command connect;
++		struct nvmf_property_set_command prop_set;
++		struct nvmf_property_get_command prop_get;
++		struct nvme_dbbuf dbbuf;
++		struct nvme_directive_cmd directive;
++#if 1
++		struct nvme_kv_store_command kv_store;
++		struct nvme_kv_retrieve_command kv_retrieve;
++		struct nvme_kv_delete_command kv_delete;
++        struct nvme_kv_append_command kv_append;
++        struct nvme_kv_iter_req_command kv_iter_req;
++        struct nvme_kv_iter_read_command kv_iter_read;
++		struct nvme_kv_exist_command kv_exist;
++#endif
++	};
++};
++
++static inline bool nvme_is_write(struct nvme_command *cmd)
++{
++	/*
++	 * What a mess...
++	 *
++	 * Why can't we simply have a Fabrics In and Fabrics out command?
++	 */
++#if 1
++	if (cmd->common.opcode == nvme_cmd_kv_store || cmd->common.opcode == nvme_cmd_kv_append)
++		return 1;
++	if (cmd->common.opcode == nvme_cmd_kv_retrieve ||
++		cmd->common.opcode == nvme_cmd_kv_delete ||
++		cmd->common.opcode == nvme_cmd_kv_iter_req ||
++		cmd->common.opcode == nvme_cmd_kv_iter_read ||
++		cmd->common.opcode == nvme_cmd_kv_exist )
++		return 0;
++#endif
++	if (unlikely(cmd->common.opcode == nvme_fabrics_command))
++		return cmd->fabrics.fctype & 1;
++	return cmd->common.opcode & 1;
++}
++
++#if 0
++static inline bool nvme_is_write(struct nvme_command *cmd)
++{
++	/*
++	 * What a mess...
++	 *
++	 * Why can't we simply have a Fabrics In and Fabrics out command?
++	 */
++	if (unlikely(cmd->common.opcode == nvme_fabrics_command))
++		return cmd->fabrics.fctype & 1;
++	return cmd->common.opcode & 1;
++}
++#endif
++enum {
++	/*
++	 * Generic Command Status:
++	 */
++	NVME_SC_SUCCESS			= 0x0,
++	NVME_SC_INVALID_OPCODE		= 0x1,
++	NVME_SC_INVALID_FIELD		= 0x2,
++	NVME_SC_CMDID_CONFLICT		= 0x3,
++	NVME_SC_DATA_XFER_ERROR		= 0x4,
++	NVME_SC_POWER_LOSS		= 0x5,
++	NVME_SC_INTERNAL		= 0x6,
++	NVME_SC_ABORT_REQ		= 0x7,
++	NVME_SC_ABORT_QUEUE		= 0x8,
++	NVME_SC_FUSED_FAIL		= 0x9,
++	NVME_SC_FUSED_MISSING		= 0xa,
++	NVME_SC_INVALID_NS		= 0xb,
++	NVME_SC_CMD_SEQ_ERROR		= 0xc,
++	NVME_SC_SGL_INVALID_LAST	= 0xd,
++	NVME_SC_SGL_INVALID_COUNT	= 0xe,
++	NVME_SC_SGL_INVALID_DATA	= 0xf,
++	NVME_SC_SGL_INVALID_METADATA	= 0x10,
++	NVME_SC_SGL_INVALID_TYPE	= 0x11,
++
++	NVME_SC_SGL_INVALID_OFFSET	= 0x16,
++	NVME_SC_SGL_INVALID_SUBTYPE	= 0x17,
++
++	NVME_SC_LBA_RANGE		= 0x80,
++	NVME_SC_CAP_EXCEEDED		= 0x81,
++	NVME_SC_NS_NOT_READY		= 0x82,
++	NVME_SC_RESERVATION_CONFLICT	= 0x83,
++
++	/*
++	 * Command Specific Status:
++	 */
++	NVME_SC_CQ_INVALID		= 0x100,
++	NVME_SC_QID_INVALID		= 0x101,
++	NVME_SC_QUEUE_SIZE		= 0x102,
++	NVME_SC_ABORT_LIMIT		= 0x103,
++	NVME_SC_ABORT_MISSING		= 0x104,
++	NVME_SC_ASYNC_LIMIT		= 0x105,
++	NVME_SC_FIRMWARE_SLOT		= 0x106,
++	NVME_SC_FIRMWARE_IMAGE		= 0x107,
++	NVME_SC_INVALID_VECTOR		= 0x108,
++	NVME_SC_INVALID_LOG_PAGE	= 0x109,
++	NVME_SC_INVALID_FORMAT		= 0x10a,
++	NVME_SC_FW_NEEDS_CONV_RESET	= 0x10b,
++	NVME_SC_INVALID_QUEUE		= 0x10c,
++	NVME_SC_FEATURE_NOT_SAVEABLE	= 0x10d,
++	NVME_SC_FEATURE_NOT_CHANGEABLE	= 0x10e,
++	NVME_SC_FEATURE_NOT_PER_NS	= 0x10f,
++	NVME_SC_FW_NEEDS_SUBSYS_RESET	= 0x110,
++	NVME_SC_FW_NEEDS_RESET		= 0x111,
++	NVME_SC_FW_NEEDS_MAX_TIME	= 0x112,
++	NVME_SC_FW_ACIVATE_PROHIBITED	= 0x113,
++	NVME_SC_OVERLAPPING_RANGE	= 0x114,
++	NVME_SC_NS_INSUFFICENT_CAP	= 0x115,
++	NVME_SC_NS_ID_UNAVAILABLE	= 0x116,
++	NVME_SC_NS_ALREADY_ATTACHED	= 0x118,
++	NVME_SC_NS_IS_PRIVATE		= 0x119,
++	NVME_SC_NS_NOT_ATTACHED		= 0x11a,
++	NVME_SC_THIN_PROV_NOT_SUPP	= 0x11b,
++	NVME_SC_CTRL_LIST_INVALID	= 0x11c,
++
++	/*
++	 * I/O Command Set Specific - NVM commands:
++	 */
++	NVME_SC_BAD_ATTRIBUTES		= 0x180,
++	NVME_SC_INVALID_PI		= 0x181,
++	NVME_SC_READ_ONLY		= 0x182,
++	NVME_SC_ONCS_NOT_SUPPORTED	= 0x183,
++
++	/*
++	 * I/O Command Set Specific - Fabrics commands:
++	 */
++	NVME_SC_CONNECT_FORMAT		= 0x180,
++	NVME_SC_CONNECT_CTRL_BUSY	= 0x181,
++	NVME_SC_CONNECT_INVALID_PARAM	= 0x182,
++	NVME_SC_CONNECT_RESTART_DISC	= 0x183,
++	NVME_SC_CONNECT_INVALID_HOST	= 0x184,
++
++	NVME_SC_DISCOVERY_RESTART	= 0x190,
++	NVME_SC_AUTH_REQUIRED		= 0x191,
++
++	/*
++	 * Media and Data Integrity Errors:
++	 */
++	NVME_SC_WRITE_FAULT		= 0x280,
++	NVME_SC_READ_ERROR		= 0x281,
++	NVME_SC_GUARD_CHECK		= 0x282,
++	NVME_SC_APPTAG_CHECK		= 0x283,
++	NVME_SC_REFTAG_CHECK		= 0x284,
++	NVME_SC_COMPARE_FAILED		= 0x285,
++	NVME_SC_ACCESS_DENIED		= 0x286,
++	NVME_SC_UNWRITTEN_BLOCK		= 0x287,
++
++	NVME_SC_DNR			= 0x4000,
++
++
++	/*
++	 * FC Transport-specific error status values for NVME commands
++	 *
++	 * Transport-specific status code values must be in the range 0xB0..0xBF
++	 */
++
++	/* Generic FC failure - catchall */
++	NVME_SC_FC_TRANSPORT_ERROR	= 0x00B0,
++
++	/* I/O failure due to FC ABTS'd */
++	NVME_SC_FC_TRANSPORT_ABORTED	= 0x00B1,
++};
++
++struct nvme_completion {
++	/*
++	 * Used by Admin and Fabrics commands to return data:
++	 */
++	union nvme_result {
++		__le16	u16;
++		__le32	u32;
++		__le64	u64;
++	} result;
++	__le16	sq_head;	/* how much of this queue may be reclaimed */
++	__le16	sq_id;		/* submission queue that generated this entry */
++	__u16	command_id;	/* of the command which completed */
++	__le16	status;		/* did the command fail, and if so, why? */
++};
++
++#define NVME_VS(major, minor, tertiary) \
++	(((major) << 16) | ((minor) << 8) | (tertiary))
++
++#define NVME_MAJOR(ver)		((ver) >> 16)
++#define NVME_MINOR(ver)		(((ver) >> 8) & 0xff)
++#define NVME_TERTIARY(ver)	((ver) & 0xff)
++
++#endif /* _LINUX_NVME_H */
+diff -urN /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/linux_nvme_ioctl.h kernel_v4.13/linux_nvme_ioctl.h
+--- /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/linux_nvme_ioctl.h	1970-01-01 09:00:00.000000000 +0900
++++ kernel_v4.13/linux_nvme_ioctl.h	2018-11-08 10:04:34.571067200 +0900
+@@ -0,0 +1,153 @@
++/*
++ * Definitions for the NVM Express ioctl interface
++ * Copyright (c) 2011-2014, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#ifndef _UAPI_LINUX_NVME_IOCTL_H
++#define _UAPI_LINUX_NVME_IOCTL_H
++
++#include <linux/types.h>
++
++struct nvme_user_io {
++	__u8	opcode;
++	__u8	flags;
++	__u16	control;
++	__u16	nblocks;
++	__u16	rsvd;
++	__u64	metadata;
++	__u64	addr;
++	__u64	slba;
++	__u32	dsmgmt;
++	__u32	reftag;
++	__u16	apptag;
++	__u16	appmask;
++};
++
++struct nvme_passthru_cmd {
++	__u8	opcode;
++	__u8	flags;
++	__u16	rsvd1;
++	__u32	nsid;
++	__u32	cdw2;
++	__u32	cdw3;
++	__u64	metadata;
++	__u64	addr;
++	__u32	metadata_len;
++	__u32	data_len;
++	__u32	cdw10;
++	__u32	cdw11;
++	__u32	cdw12;
++	__u32	cdw13;
++	__u32	cdw14;
++	__u32	cdw15;
++	__u32	timeout_ms;
++	__u32	result;
++};
++
++#define	KVS_SUCCESS		0
++#define KVS_ERR_ALIGNMENT	(-1)
++#define KVS_ERR_CAPAPCITY	(-2)
++#define KVS_ERR_CLOSE	(-3)
++#define KVS_ERR_CONT_EXIST	(-4)
++#define KVS_ERR_CONT_NAME	(-5)
++#define KVS_ERR_CONT_NOT_EXIST	(-6)
++#define KVS_ERR_DEVICE_NOT_EXIST (-7)
++#define KVS_ERR_GROUP	(-8)
++#define KVS_ERR_INDEX	(-9)
++#define KVS_ERR_IO	(-10)
++#define KVS_ERR_KEY	(-11)
++#define KVS_ERR_KEY_TYPE	(-12)
++#define KVS_ERR_MEMORY	(-13)
++#define KVS_ERR_NULL_INPUT	(-14)
++#define KVS_ERR_OFFSET	(-15)
++#define KVS_ERR_OPEN	(-16)
++#define KVS_ERR_OPTION_NOT_SUPPORTED	(-17)
++#define KVS_ERR_PERMISSION	(-18)
++#define KVS_ERR_SPACE	(-19)
++#define KVS_ERR_TIMEOUT	(-20)
++#define KVS_ERR_TUPLE_EXIST	(-21)
++#define KVS_ERR_TUPLE_NOT_EXIST	(-22)
++#define KVS_ERR_VALUE	(-23)
++
++
++struct nvme_passthru_kv_cmd {
++	__u8	opcode;
++	__u8	flags;
++	__u16	rsvd1;
++	__u32	nsid;
++	__u32	cdw2;
++	__u32	cdw3;
++	__u32	cdw4;
++	__u32	cdw5;
++	__u64	data_addr;
++	__u32	data_length;
++	__u32	key_length;
++	__u32	cdw10;
++	__u32	cdw11;
++	union {
++		struct {
++			__u64 key_addr;
++			__u32 rsvd5;
++			__u32 rsvd6;
++		};
++		__u8 key[16];
++		struct {
++			__u32 cdw12;
++			__u32 cdw13;
++			__u32 cdw14;
++			__u32 cdw15;
++		};
++	};
++	__u32	timeout_ms;
++	__u32	result;
++	__u32	status;
++	__u32	ctxid;
++	__u64	reqid;
++};
++
++struct nvme_aioctx {
++	__u32	ctxid;
++	__u32	eventfd;
++};
++
++
++struct nvme_aioevent {
++	__u64	reqid;
++	__u32	ctxid;
++	__u32	result;
++	__u16	status;
++};
++
++#define MAX_AIO_EVENTS	128
++struct nvme_aioevents {
++	__u16	nr;
++    __u32   ctxid;
++	struct nvme_aioevent events[MAX_AIO_EVENTS];
++};
++
++
++#define nvme_admin_cmd nvme_passthru_cmd
++
++#define NVME_IOCTL_ID		_IO('N', 0x40)
++#define NVME_IOCTL_ADMIN_CMD	_IOWR('N', 0x41, struct nvme_admin_cmd)
++#define NVME_IOCTL_SUBMIT_IO	_IOW('N', 0x42, struct nvme_user_io)
++#define NVME_IOCTL_IO_CMD	_IOWR('N', 0x43, struct nvme_passthru_cmd)
++#define NVME_IOCTL_RESET	_IO('N', 0x44)
++#define NVME_IOCTL_SUBSYS_RESET	_IO('N', 0x45)
++#define NVME_IOCTL_RESCAN	_IO('N', 0x46)
++
++#define NVME_IOCTL_AIO_CMD		_IOWR('N', 0x47, struct nvme_passthru_kv_cmd)
++#define NVME_IOCTL_SET_AIOCTX	_IOWR('N', 0x48, struct nvme_aioctx)
++#define NVME_IOCTL_DEL_AIOCTX	_IOWR('N', 0x49, struct nvme_aioctx)
++#define NVME_IOCTL_GET_AIOEVENT	_IOWR('N', 0x50, struct nvme_aioevents)
++#define NVME_IOCTL_IO_KV_CMD	_IOWR('N', 0x51, struct nvme_passthru_kv_cmd)
++#endif /* _UAPI_LINUX_NVME_IOCTL_H */
+diff -urN /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/Makefile kernel_v4.13/Makefile
+--- /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/Makefile	2018-05-09 19:09:35.205889659 +0900
++++ kernel_v4.13/Makefile	2018-11-08 10:04:34.571067200 +0900
+@@ -1,16 +1,17 @@
+-obj-$(CONFIG_NVME_CORE)			+= nvme-core.o
+-obj-$(CONFIG_BLK_DEV_NVME)		+= nvme.o
+-obj-$(CONFIG_NVME_FABRICS)		+= nvme-fabrics.o
+-obj-$(CONFIG_NVME_RDMA)			+= nvme-rdma.o
+-obj-$(CONFIG_NVME_FC)			+= nvme-fc.o
+-
++obj-m					+= nvme-core.o
++obj-m					+= nvme.o
++#obj-m					+= nvme-fabrics.o
++#obj-m					+= nvme-rdma.o
++#obj-m					+= nvme-fc.o
+ nvme-core-y				:= core.o
+ nvme-core-$(CONFIG_NVM)			+= lightnvm.o
+-
+ nvme-y					+= pci.o
+-
+ nvme-fabrics-y				+= fabrics.o
+-
+ nvme-rdma-y				+= rdma.o
+-
+ nvme-fc-y				+= fc.o
++
++all:
++	make -C /lib/modules/`uname -r`/build M=`pwd` modules
++clean:
++	make -C /lib/modules/`uname -r`/build M=`pwd` clean
++
+diff -urN /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/nvme.h kernel_v4.13/nvme.h
+--- /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/nvme.h	2018-05-09 19:09:35.205889659 +0900
++++ kernel_v4.13/nvme.h	2018-11-08 10:04:34.571067200 +0900
+@@ -10,17 +10,37 @@
+  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+  * more details.
+  */
+-
+ #ifndef _NVME_H
+ #define _NVME_H
+ 
+-#include <linux/nvme.h>
++#if 1
++//#define KV_NVME_DUMMY_OP
++//#define KV_NVME_DUMMY_OP_REPORT
++#define KSID_SUPPORT
++#endif
++
++#include "linux_nvme.h"
+ #include <linux/pci.h>
+ #include <linux/kref.h>
+ #include <linux/blk-mq.h>
+ #include <linux/lightnvm.h>
+ #include <linux/sed-opal.h>
+ 
++#if 1
++#define is_kv_append_cmd(opcode)	((opcode) == nvme_cmd_kv_append)
++#define is_kv_store_cmd(opcode)	((opcode) == nvme_cmd_kv_store)
++#define is_kv_retrieve_cmd(opcode)	((opcode) == nvme_cmd_kv_retrieve)
++#define is_kv_delete_cmd(opcode)	((opcode) == nvme_cmd_kv_delete)
++#define is_kv_iter_req_cmd(opcode)	((opcode) == nvme_cmd_kv_iter_req)
++#define is_kv_iter_read_cmd(opcode)	((opcode) == nvme_cmd_kv_iter_read)
++#define is_kv_exist_cmd(opcode)	((opcode) == nvme_cmd_kv_exist)
++#define is_kv_cmd(opcode)	(is_kv_store_cmd(opcode) || is_kv_append_cmd(opcode) ||\
++		is_kv_retrieve_cmd(opcode) || is_kv_delete_cmd(opcode) ||\
++        is_kv_iter_req_cmd(opcode) || is_kv_iter_read_cmd(opcode) ||\
++		is_kv_exist_cmd(opcode))
++#endif
++
++
+ extern unsigned char nvme_io_timeout;
+ #define NVME_IO_TIMEOUT	(nvme_io_timeout * HZ)
+ 
+@@ -89,6 +109,21 @@
+ 	u16			status;
+ };
+ 
++#if 1
++struct nvme_io_param {
++    struct nvme_request req;
++    struct scatterlist* kv_data_sg_ptr;
++    struct scatterlist* kv_meta_sg_ptr;
++    int kv_data_nents;
++    int kv_data_len;
++};
++
++static inline struct nvme_io_param *nvme_io_param(struct request *req)
++{
++	return blk_mq_rq_to_pdu(req);
++}
++#endif
++
+ enum {
+ 	NVME_REQ_CANCELLED		= (1 << 0),
+ };
+diff -urN /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/pci.c kernel_v4.13/pci.c
+--- /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/pci.c	2018-05-09 19:09:35.209889621 +0900
++++ kernel_v4.13/pci.c	2018-11-08 10:04:34.575067166 +0900
+@@ -93,7 +93,7 @@
+ 	struct mutex shutdown_lock;
+ 	bool subsystem;
+ 	void __iomem *cmb;
+-	dma_addr_t cmb_dma_addr;
++	pci_bus_addr_t cmb_bus_addr;
+ 	u64 cmb_size;
+ 	u32 cmbsz;
+ 	u32 cmbloc;
+@@ -175,8 +175,16 @@
+  * allocated to store the PRP list.
+  */
+ struct nvme_iod {
++#if 1
++    struct nvme_io_param param; 
++#else
+ 	struct nvme_request req;
++#endif
+ 	struct nvme_queue *nvmeq;
++#if 1
++	int kv_cmd;
++	int rserv;
++#endif
+ 	int aborted;
+ 	int npages;		/* In the PRP list. 0 means small pool in use */
+ 	int nents;		/* Used in scatterlist */
+@@ -430,11 +438,31 @@
+ 	return (__le64 **)(iod->sg + blk_rq_nr_phys_segments(req));
+ }
+ 
++#if 1
++static blk_status_t __nvme_init_iod(struct request *rq, struct nvme_dev *dev, bool kv_cmd)
++#else
+ static blk_status_t nvme_init_iod(struct request *rq, struct nvme_dev *dev)
++#endif
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(rq);
++#if 1
++	int nseg;
++	unsigned int size;
++#else
+ 	int nseg = blk_rq_nr_phys_segments(rq);
+ 	unsigned int size = blk_rq_payload_bytes(rq);
++#endif
++
++#if 1
++    if (kv_cmd) {
++        struct nvme_io_param* param = &iod->param;
++	    nseg = param->kv_data_nents;
++	    size = param->kv_data_len;
++    } else {
++	    nseg = blk_rq_nr_phys_segments(rq);
++	    size = blk_rq_payload_bytes(rq);
++    }
++#endif
+ 
+ 	if (nseg > NVME_INT_PAGES || size > NVME_INT_BYTES(dev)) {
+ 		iod->sg = kmalloc(nvme_iod_alloc_size(dev, size, nseg), GFP_ATOMIC);
+@@ -443,7 +471,9 @@
+ 	} else {
+ 		iod->sg = iod->inline_sg;
+ 	}
+-
++#if 1
++    iod->kv_cmd = 0;
++#endif
+ 	iod->aborted = 0;
+ 	iod->npages = -1;
+ 	iod->nents = 0;
+@@ -452,6 +482,20 @@
+ 	return BLK_STS_OK;
+ }
+ 
++#if 1
++
++static blk_status_t nvme_init_iod(struct request *rq, struct nvme_dev *dev)
++{
++    return __nvme_init_iod(rq, dev, false);
++}
++
++static blk_status_t nvme_init_iod_for_kv(struct request *rq, struct nvme_dev *dev)
++{
++    return __nvme_init_iod(rq, dev, true);
++}
++#endif
++
++
+ static void nvme_free_iod(struct nvme_dev *dev, struct request *req)
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+@@ -540,11 +584,16 @@
+ }
+ #endif
+ 
++
+ static blk_status_t nvme_setup_prps(struct nvme_dev *dev, struct request *req)
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 	struct dma_pool *pool;
++#if 1
++	int length;
++#else
+ 	int length = blk_rq_payload_bytes(req);
++#endif
+ 	struct scatterlist *sg = iod->sg;
+ 	int dma_len = sg_dma_len(sg);
+ 	u64 dma_addr = sg_dma_address(sg);
+@@ -555,6 +604,14 @@
+ 	dma_addr_t prp_dma;
+ 	int nprps, i;
+ 
++#if 1
++    if (iod->kv_cmd) {
++	    length = iod->param.kv_data_len;
++    } else {
++	    length = blk_rq_payload_bytes(req);
++    }
++#endif
++
+ 	length -= (page_size - offset);
+ 	if (length <= 0)
+ 		return BLK_STS_OK;
+@@ -635,6 +692,72 @@
+ 
+ }
+ 
++#if 1
++static blk_status_t nvme_kv_map_data(struct nvme_dev *dev, struct request *req,
++		struct nvme_command *cmnd)
++{
++	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
++    struct nvme_io_param* param = &iod->param;
++	enum dma_data_direction dma_dir = DMA_BIDIRECTIONAL;
++	blk_status_t ret = BLK_STS_IOERR;
++
++    if (param->kv_data_sg_ptr) {
++        struct scatterlist* sg;
++        int i;
++        /* copy user sg list to iod->sg */
++        for_each_sg(param->kv_data_sg_ptr, sg, param->kv_data_nents, i) {
++            iod->sg[i] = *sg;
++        }
++        iod->nents = param->kv_data_nents;
++    	ret = BLK_STS_RESOURCE;
++    	if (!dma_map_sg_attrs(dev->dev, iod->sg, iod->nents, dma_dir,
++				DMA_ATTR_NO_WARN))
++		goto out;
++
++    	ret = nvme_setup_prps(dev, req);
++        if (ret != BLK_STS_OK)
++	    	goto out_unmap;
++
++		cmnd->kv_store.dptr.prp1 = cpu_to_le64(sg_dma_address(iod->sg));
++		cmnd->kv_store.dptr.prp2 = cpu_to_le64(iod->first_dma);
++    }
++	ret = BLK_STS_IOERR;
++
++	if (param->kv_meta_sg_ptr)
++	{
++		if (!dma_map_sg(dev->dev, param->kv_meta_sg_ptr, 1, DMA_BIDIRECTIONAL))
++			goto out_unmap;
++		cmnd->kv_store.key_prp = cpu_to_le64(sg_dma_address(param->kv_meta_sg_ptr));
++	} 
++	return BLK_STS_OK;
++
++out_unmap:
++    if (param->kv_data_sg_ptr)
++	    dma_unmap_sg(dev->dev, iod->sg, iod->nents, dma_dir);
++out:
++	return ret;
++}
++
++
++static void nvme_kv_unmap_data(struct nvme_dev *dev, struct request *req)
++{
++	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
++    struct nvme_io_param* param = &iod->param;
++	enum dma_data_direction dma_dir = DMA_BIDIRECTIONAL;
++
++	if (param->kv_data_sg_ptr) {
++		dma_unmap_sg(dev->dev, iod->sg, iod->nents, dma_dir);
++    }
++	if (param->kv_meta_sg_ptr)
++	{
++		dma_unmap_sg(dev->dev, param->kv_meta_sg_ptr, 1, DMA_BIDIRECTIONAL);
++	}
++    nvme_cleanup_cmd(req);
++	nvme_free_iod(dev, req);
++}
++#endif
++
++
+ static blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req,
+ 		struct nvme_command *cmnd)
+ {
+@@ -643,7 +766,11 @@
+ 	enum dma_data_direction dma_dir = rq_data_dir(req) ?
+ 			DMA_TO_DEVICE : DMA_FROM_DEVICE;
+ 	blk_status_t ret = BLK_STS_IOERR;
+-
++#if 1
++    if (is_kv_cmd(cmnd->common.opcode)) {
++        return nvme_kv_map_data(dev, req, cmnd);
++    }
++#endif
+ 	sg_init_table(iod->sg, blk_rq_nr_phys_segments(req));
+ 	iod->nents = blk_rq_map_sg(q, req, iod->sg);
+ 	if (!iod->nents)
+@@ -691,7 +818,11 @@
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 	enum dma_data_direction dma_dir = rq_data_dir(req) ?
+ 			DMA_TO_DEVICE : DMA_FROM_DEVICE;
+-
++#if 1
++    if (iod->kv_cmd) {
++        return nvme_kv_unmap_data(dev, req);
++    }
++#endif
+ 	if (iod->nents) {
+ 		dma_unmap_sg(dev->dev, iod->sg, iod->nents, dma_dir);
+ 		if (blk_integrity_rq(req)) {
+@@ -717,16 +848,39 @@
+ 	struct request *req = bd->rq;
+ 	struct nvme_command cmnd;
+ 	blk_status_t ret;
+-
++#if 1
++    bool b_kv_cmd = false;
++#endif
+ 	ret = nvme_setup_cmd(ns, req, &cmnd);
+ 	if (ret)
+ 		return ret;
+ 
++#if 1
++    b_kv_cmd = is_kv_cmd(cmnd.common.opcode);
++    if (b_kv_cmd) {
++	    ret = nvme_init_iod_for_kv(req, dev);
++	    if (ret)
++		    goto out_free_cmd;
++    } else {
++	    ret = nvme_init_iod(req, dev);
++	    if (ret)
++		    goto out_free_cmd;
++    }
++#else
+ 	ret = nvme_init_iod(req, dev);
+ 	if (ret)
+ 		goto out_free_cmd;
++#endif
++
++#if 1
++    if (b_kv_cmd) {
++        struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
++        iod->kv_cmd = 1;
++    }
++#endif
+ 
+-	if (blk_rq_nr_phys_segments(req)) {
++	if (blk_rq_nr_phys_segments(req) ||
++            is_kv_cmd(cmnd.common.opcode)) {
+ 		ret = nvme_map_data(dev, req, &cmnd);
+ 		if (ret)
+ 			goto out_cleanup_iod;
+@@ -734,6 +888,66 @@
+ 
+ 	blk_mq_start_request(req);
+ 
++#if 1
++#ifdef KV_NVME_DUMMY_OP
++	if (is_kv_cmd(cmnd.common.opcode)) {
++#ifdef KV_NVME_DUMMY_OP_REPORT
++		__u32 *data = (__u32*) cmnd.common.cdw2;
++		pr_err("[dump nvme kv comand]\n");
++		pr_err("\topcode:(%02x)\n", cmnd.common.opcode);
++		pr_err("\tflags:(%02x)\n", cmnd.common.flags);
++		pr_err("\tcommand id:(%04x)\n", cmnd.common.command_id);
++		pr_err("\tns id:(%08x)\n", cmnd.common.nsid);
++		pr_err("\tcdw2:(%08x)\n", data[0]);
++		pr_err("\tcdw3:(%08x)\n", data[1]);
++		pr_err("\tcdw4:(%08x)\n", data[2]);
++		pr_err("\tcdw5:(%08x)\n", data[3]);
++		pr_err("\tcdw6:(%08x)\n", data[4]);
++		pr_err("\tcdw7:(%08x)\n", data[5]);
++		pr_err("\tcdw8:(%08x)\n", data[6]);
++		pr_err("\tcdw9:(%08x)\n", data[7]);
++		pr_err("\tcdw10:(%08x)\n", data[8]);
++		pr_err("\tcdw11:(%08x)\n", data[9]);
++		pr_err("\tcdw12:(%08x)\n", data[10]);
++		pr_err("\tcdw13:(%08x)\n", data[11]);
++		pr_err("\tcdw14:(%08x)\n", data[12]);
++		pr_err("\tcdw15:(%08x)\n", data[13]);
++#endif
++        nvme_req(req)->status = NVME_SC_SUCCESS;
++        nvme_req(req)->result.u32 = NVME_SC_SUCCESS;
++		if (is_kv_retrieve_cmd(cmnd.common.opcode)) {
++            nvme_req(req)->result.u32 = cmnd.common.cdw10[5];
++        } 
++		blk_mq_complete_request(req);
++	    return BLK_STS_OK;
++	}
++#endif
++#if 0
++	if (is_kv_cmd(cmnd.common.opcode)) {
++		__u32 *data = (__u32*) cmnd.common.cdw2;
++		pr_err("[dump nvme kv comand]\n");
++		pr_err("\topcode:(%02x)\n", cmnd.common.opcode);
++		pr_err("\tflags:(%02x)\n", cmnd.common.flags);
++		pr_err("\tcommand id:(%04x)\n", cmnd.common.command_id);
++		pr_err("\tns id:(%08x)\n", cmnd.common.nsid);
++		pr_err("\tcdw2:(%08x)\n", data[0]);
++		pr_err("\tcdw3:(%08x)\n", data[1]);
++		pr_err("\tcdw4:(%08x)\n", data[2]);
++		pr_err("\tcdw5:(%08x)\n", data[3]);
++		pr_err("\tcdw6:(%08x)\n", data[4]);
++		pr_err("\tcdw7:(%08x)\n", data[5]);
++		pr_err("\tcdw8:(%08x)\n", data[6]);
++		pr_err("\tcdw9:(%08x)\n", data[7]);
++		pr_err("\tcdw10:(%08x)\n", data[8]);
++		pr_err("\tcdw11:(%08x)\n", data[9]);
++		pr_err("\tcdw12:(%08x)\n", data[10]);
++		pr_err("\tcdw13:(%08x)\n", data[11]);
++		pr_err("\tcdw14:(%08x)\n", data[12]);
++		pr_err("\tcdw15:(%08x)\n", data[13]);
++    }
++#endif
++
++#endif
+ 	spin_lock_irq(&nvmeq->q_lock);
+ 	if (unlikely(nvmeq->cq_vector < 0)) {
+ 		ret = BLK_STS_IOERR;
+@@ -1218,7 +1432,7 @@
+ 	if (qid && dev->cmb && use_cmb_sqes && NVME_CMB_SQS(dev->cmbsz)) {
+ 		unsigned offset = (qid - 1) * roundup(SQ_SIZE(depth),
+ 						      dev->ctrl.page_size);
+-		nvmeq->sq_dma_addr = dev->cmb_dma_addr + offset;
++		nvmeq->sq_dma_addr = dev->cmb_bus_addr + offset;
+ 		nvmeq->sq_cmds_io = dev->cmb + offset;
+ 	} else {
+ 		nvmeq->sq_cmds = dma_alloc_coherent(dev->dev, SQ_SIZE(depth),
+@@ -1517,7 +1731,7 @@
+ 	resource_size_t bar_size;
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+ 	void __iomem *cmb;
+-	dma_addr_t dma_addr;
++	int bar;
+ 
+ 	dev->cmbsz = readl(dev->bar + NVME_REG_CMBSZ);
+ 	if (!(NVME_CMB_SZ(dev->cmbsz)))
+@@ -1530,7 +1744,8 @@
+ 	szu = (u64)1 << (12 + 4 * NVME_CMB_SZU(dev->cmbsz));
+ 	size = szu * NVME_CMB_SZ(dev->cmbsz);
+ 	offset = szu * NVME_CMB_OFST(dev->cmbloc);
+-	bar_size = pci_resource_len(pdev, NVME_CMB_BIR(dev->cmbloc));
++	bar = NVME_CMB_BIR(dev->cmbloc);
++	bar_size = pci_resource_len(pdev, bar);
+ 
+ 	if (offset > bar_size)
+ 		return NULL;
+@@ -1543,12 +1758,11 @@
+ 	if (size > bar_size - offset)
+ 		size = bar_size - offset;
+ 
+-	dma_addr = pci_resource_start(pdev, NVME_CMB_BIR(dev->cmbloc)) + offset;
+-	cmb = ioremap_wc(dma_addr, size);
++	cmb = ioremap_wc(pci_resource_start(pdev, bar) + offset, size);
+ 	if (!cmb)
+ 		return NULL;
+ 
+-	dev->cmb_dma_addr = dma_addr;
++	dev->cmb_bus_addr = pci_bus_address(pdev, bar) + offset;
+ 	dev->cmb_size = size;
+ 	return cmb;
+ }
+@@ -1609,18 +1823,16 @@
+ 	dev->host_mem_descs = NULL;
+ }
+ 
+-static int nvme_alloc_host_mem(struct nvme_dev *dev, u64 min, u64 preferred)
++static int __nvme_alloc_host_mem(struct nvme_dev *dev, u64 preferred,
++		u32 chunk_size)
+ {
+ 	struct nvme_host_mem_buf_desc *descs;
+-	u32 chunk_size, max_entries, len;
++	u32 max_entries, len;
+ 	dma_addr_t descs_dma;
+ 	int i = 0;
+ 	void **bufs;
+ 	u64 size = 0, tmp;
+ 
+-	/* start big and work our way down */
+-	chunk_size = min(preferred, (u64)PAGE_SIZE << MAX_ORDER);
+-retry:
+ 	tmp = (preferred + chunk_size - 1);
+ 	do_div(tmp, chunk_size);
+ 	max_entries = tmp;
+@@ -1647,15 +1859,9 @@
+ 		i++;
+ 	}
+ 
+-	if (!size || (min && size < min)) {
+-		dev_warn(dev->ctrl.device,
+-			"failed to allocate host memory buffer.\n");
++	if (!size)
+ 		goto out_free_bufs;
+-	}
+ 
+-	dev_info(dev->ctrl.device,
+-		"allocated %lld MiB host memory buffer.\n",
+-		size >> ilog2(SZ_1M));
+ 	dev->nr_host_mem_descs = i;
+ 	dev->host_mem_size = size;
+ 	dev->host_mem_descs = descs;
+@@ -1676,21 +1882,35 @@
+ 	dma_free_coherent(dev->dev, max_entries * sizeof(*descs), descs,
+ 			descs_dma);
+ out:
+-	/* try a smaller chunk size if we failed early */
+-	if (chunk_size >= PAGE_SIZE * 2 && (i == 0 || size < min)) {
+-		chunk_size /= 2;
+-		goto retry;
+-	}
+ 	dev->host_mem_descs = NULL;
+ 	return -ENOMEM;
+ }
+ 
+-static void nvme_setup_host_mem(struct nvme_dev *dev)
++static int nvme_alloc_host_mem(struct nvme_dev *dev, u64 min, u64 preferred)
++{
++	u32 chunk_size;
++
++	/* start big and work our way down */
++	for (chunk_size = min_t(u64, preferred, PAGE_SIZE * MAX_ORDER_NR_PAGES);
++	     chunk_size >= PAGE_SIZE * 2;
++	     chunk_size /= 2) {
++		if (!__nvme_alloc_host_mem(dev, preferred, chunk_size)) {
++			if (!min || dev->host_mem_size >= min)
++				return 0;
++			nvme_free_host_mem(dev);
++		}
++	}
++
++	return -ENOMEM;
++}
++
++static int nvme_setup_host_mem(struct nvme_dev *dev)
+ {
+ 	u64 max = (u64)max_host_mem_size_mb * SZ_1M;
+ 	u64 preferred = (u64)dev->ctrl.hmpre * 4096;
+ 	u64 min = (u64)dev->ctrl.hmmin * 4096;
+ 	u32 enable_bits = NVME_HOST_MEM_ENABLE;
++	int ret = 0;
+ 
+ 	preferred = min(preferred, max);
+ 	if (min > max) {
+@@ -1698,7 +1918,7 @@
+ 			"min host memory (%lld MiB) above limit (%d MiB).\n",
+ 			min >> ilog2(SZ_1M), max_host_mem_size_mb);
+ 		nvme_free_host_mem(dev);
+-		return;
++		return 0;
+ 	}
+ 
+ 	/*
+@@ -1712,12 +1932,21 @@
+ 	}
+ 
+ 	if (!dev->host_mem_descs) {
+-		if (nvme_alloc_host_mem(dev, min, preferred))
+-			return;
++		if (nvme_alloc_host_mem(dev, min, preferred)) {
++			dev_warn(dev->ctrl.device,
++				"failed to allocate host memory buffer.\n");
++			return 0; /* controller must work without HMB */
++		}
++
++		dev_info(dev->ctrl.device,
++			"allocated %lld MiB host memory buffer.\n",
++			dev->host_mem_size >> ilog2(SZ_1M));
+ 	}
+ 
+-	if (nvme_set_host_mem(dev, enable_bits))
++	ret = nvme_set_host_mem(dev, enable_bits);
++	if (ret)
+ 		nvme_free_host_mem(dev);
++	return ret;
+ }
+ 
+ static int nvme_setup_io_queues(struct nvme_dev *dev)
+@@ -2161,8 +2390,11 @@
+ 				 "unable to allocate dma for dbbuf\n");
+ 	}
+ 
+-	if (dev->ctrl.hmpre)
+-		nvme_setup_host_mem(dev);
++	if (dev->ctrl.hmpre) {
++		result = nvme_setup_host_mem(dev);
++		if (result < 0)
++			goto out;
++	}
+ 
+ 	result = nvme_setup_io_queues(dev);
+ 	if (result)
+diff -urN /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/rdma.c kernel_v4.13/rdma.c
+--- /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/rdma.c	2018-05-09 19:09:35.209889621 +0900
++++ kernel_v4.13/rdma.c	2018-11-08 10:04:34.575067166 +0900
+@@ -23,7 +23,7 @@
+ #include <linux/list.h>
+ #include <linux/mutex.h>
+ #include <linux/scatterlist.h>
+-#include <linux/nvme.h>
++#include "linux_nvme.h"
+ #include <asm/unaligned.h>
+ 
+ #include <rdma/ib_verbs.h>
+diff -urN /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/re_insmod.sh kernel_v4.13/re_insmod.sh
+--- /home/junghan/workspace/ref-works/nova_fast16/linux-nova/drivers/nvme/host/re_insmod.sh	1970-01-01 09:00:00.000000000 +0900
++++ kernel_v4.13/re_insmod.sh	2018-11-08 10:04:34.575067166 +0900
+@@ -0,0 +1,7 @@
++#!/bin/bash
++
++sudo rmmod nvme
++sudo rmmod nvme_core
++
++sudo insmod nvme-core.ko
++sudo insmod nvme.ko
