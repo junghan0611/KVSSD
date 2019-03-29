@@ -48,7 +48,7 @@ extern "C" {
 #define SAMSUNG_KV_MIN_VALUE_LEN 0
 #define SAMSUNG_KV_MAX_VALUE_LEN (2*1024*1024)
 
-#define SAMSUNG_MAX_ITERATORS 8
+#define SAMSUNG_MAX_ITERATORS 16
 
 /**
  * return value from all interfaces
@@ -132,8 +132,7 @@ typedef int32_t kv_result;
  */
 
 // forward declaration of each handle
-struct _kv_iterator_handle;
-typedef struct _kv_iterator_handle* kv_iterator_handle;
+typedef uint8_t kv_iterator_handle;
 
 struct _kv_device_handle;
 typedef struct _kv_device_handle* kv_device_handle;
@@ -320,8 +319,15 @@ typedef enum {
 // kv_store_option
 typedef enum {
   KV_STORE_OPT_DEFAULT    = 0x00, ///< [DEFAULT] storing key value pair(or overwriting given value if key exists)
-  KV_STORE_OPT_IDEMPOTENT = 0x01, ///< [MANDATORY] storing KV pair only if the key in the pair does not exist already
-  KV_STORE_OPT_COMPRESS   = 0x02, ///< [OPTIONAL] compressing value before writing it to the storage if a device has the capability. This is a hint to a device, idempotent and compression can be simultaneously set if the device support compression.
+  KV_STORE_OPT_COMPRESS   = 0x01, ///< [OPTIONAL] compressing value before writing it to the storage if a device has the capability. This is a hint to a device, idempotent and compression can be simultaneously set if the device support compression.
+  KV_STORE_OPT_IDEMPOTENT = 0x02, ///< [MANDATORY] storing KV pair only if the key in the pair does not exist already
+
+  KV_STORE_OPT_UPDATE_ONLY = 0x03,
+  KV_STORE_OPT_APPEND = 0x04,
+  KV_STORE_OPT_POST_WITH_COMPRESS = 0x05,
+  KV_STORE_OPT_UPDATE_ONLY_COMPRESS = 0x06,
+  KV_STORE_OPT_NOOVERWRITE_COMPRESS = 0x07,
+  KV_STORE_OPT_APPEND_COMPRESS = 0x08,
 } kv_store_option;
 
 /**
@@ -368,20 +374,21 @@ typedef struct {
   uint32_t bit_pattern; ///< bit pattern for condition 
 } kv_group_condition; 
 
+
 /**
   kv_iterator
   kv_iterator represents a group of key and value pairs which is used for iteration. 
  */
 typedef struct {
-  uint32_t itid;                    ///< iterator identifier
-  kv_iterator_option iter_op;       ///< iterator option
-  kv_group_condition  *iter_cond;    ///< iterator condition 
-  void *extended_info;              ///< vendor specific extended iterator information
+  uint8_t handle_id; ///< iterator identifier
+  uint8_t status;
+  uint8_t type; ///< iterator option
+  uint8_t keyspace_id;
+  uint32_t prefix; ///< iterator condition bit pattern
+  uint32_t bitmask; ///< iterator condition bit mask
+  uint8_t is_eof;
+  uint8_t reserved[3];
 } kv_iterator; 
-
-// internal kv_iterator handle structure
-//typedef uint32_t _kv_iterator_handle;
-//forward declaration
 
 /**
   kv_iterator_list
@@ -682,6 +689,7 @@ typedef struct {
 
         kv_iterator_handle hiter;
     } result;
+
 
 //private
     void (*post_fn)(kv_io_context *op);   ///< asynchronous notification callback (valid only for async I/O)
@@ -1214,7 +1222,7 @@ kv_result kv_iterator_next(kv_queue_handle que_hdl, kv_namespace_handle ns_hdl, 
  *
  * kv_list_iterators
 
-  This interface retrieves a list of iterators opened in this device and returns them in the given iterator array, kv_iters. The number of iterator handles are set to iter_cnt. As an input, iter_cnt has the buffer size for kv_iterator. As an output, iter_cnt is set to the number of iterators stored in the buffer.
+  This interface retrieves a list of all iterators (open or closed) in this device and returns them in the given iterator array, kv_iters. The number of iterator handles are set to iter_cnt. As an input, iter_cnt has the buffer size for kv_iterator. As an output, iter_cnt is set to the number of iterators stored in the buffer.
   
   If a user defines an interrupt handler (i.e., kv_set_interrupt_handler()) and a postprocess function (i.e., post_fn), the interrupt handler will call the postprocess function when the device triggers an interrupt to notify operation completion. If no postprocess function is defined, the interrupt handler just finishes its operation. If no interrupt handler is defined but a postprocess function is defined, the function is ignored.
   
